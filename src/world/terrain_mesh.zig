@@ -341,7 +341,8 @@ test "combined meshes has land" {
     var set = try buildCombined(allocator, &hf, null, null, null, .lod1);
     defer set.deinit();
     try std.testing.expect(set.land.indices.len > 0);
-    try std.testing.expect(set.combined != null);
+    // Combined distant merge is opt-in (null by default) to avoid double-draw shards.
+    try std.testing.expect(set.combined == null);
 }
 
 test "mesh lod reduces indices" {

@@ -159,8 +159,11 @@ pub const TerrainSplat = struct {
         self.chunk_count = 0;
     }
 
+    /// Max full chunk uploads per sync (spreads GPU stalls across frames).
+    pub const max_uploads_per_frame: u32 = 2;
+
     /// Upload/update GPU meshes + splat masks for ready streamer tiles.
-    pub fn sync(self: *TerrainSplat, gctx: *zgpu.GraphicsContext, streamer: *const Streamer) !void {
+    pub fn sync(self: *TerrainSplat, gctx: *zgpu.GraphicsContext, streamer: *Streamer) !void {
         // Drop GPU chunks no longer resident.
         var i: u32 = 0;
         while (i < self.chunk_count) {
@@ -174,6 +177,7 @@ pub const TerrainSplat = struct {
             i += 1;
         }
 
+        var uploads: u32 = 0;
         var it = streamer.chunks.iterator();
         while (it.next()) |entry| {
             if (entry.value_ptr.state != .ready) continue;
@@ -183,14 +187,23 @@ pub const TerrainSplat = struct {
 
             if (self.findChunk(coord)) |idx| {
                 if (self.chunks[idx].generation == tile.gpu_generation) continue;
+                if (uploads >= max_uploads_per_frame) break;
                 destroyChunk(gctx, &self.chunks[idx]);
                 self.chunks[idx] = try self.uploadChunk(gctx, tile);
+                uploads += 1;
             } else {
                 if (self.chunk_count >= max_gpu_chunks) break;
+                if (uploads >= max_uploads_per_frame) break;
                 self.chunks[self.chunk_count] = try self.uploadChunk(gctx, tile);
                 self.chunk_count += 1;
+                uploads += 1;
             }
         }
+        // Soft backpressure into streamer (Dagor resident / delayed-load budget).
+        // Cap hint also reflects pending CPU-ready chunks waiting for upload slots.
+        const pending_cpu = streamer.stats.ready;
+        const hint = @max(self.chunk_count, @min(pending_cpu, max_gpu_chunks));
+        streamer.setGpuReadyHint(hint);
     }
 
     fn findChunk(self: *TerrainSplat, coord: ChunkCoord) ?u32 {

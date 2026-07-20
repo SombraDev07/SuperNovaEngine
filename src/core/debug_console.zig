@@ -41,6 +41,10 @@ pub const DebugConsole = struct {
     stream_ready: u32 = 0,
     stream_loading: u32 = 0,
     stream_resident: u32 = 0,
+    stream_lod_up: u64 = 0,
+    stream_budget_cuts: u64 = 0,
+    stream_gpu_bp: u64 = 0,
+    stream_zones: u32 = 0,
     /// Optional app command hook (terrain editor, etc.). Return true if handled.
     command_context: ?*anyopaque = null,
     command_handler: ?*const fn (ctx: ?*anyopaque, console: *DebugConsole, cmd_line: []const u8) bool = null,
@@ -103,6 +107,12 @@ pub const DebugConsole = struct {
             self.stream_ready,
             self.stream_loading,
             self.stream_resident,
+        });
+        zgui.text("Stream+: lod↑{d}  budget×{d}  gpuBP×{d}  zones={d}", .{
+            self.stream_lod_up,
+            self.stream_budget_cuts,
+            self.stream_gpu_bp,
+            self.stream_zones,
         });
         zgui.separator();
 

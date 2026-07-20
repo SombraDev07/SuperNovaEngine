@@ -105,11 +105,11 @@
 ## FASE 3: Mundo Aberto - Core (Meses 12-24)
 
 ### 3.1 World Streaming
-> **IA2 (2026-07-20):** ~**68%** overall — **NOK**. `[x]` prematuros reabertos. Há grid/async/histerese/double-buffer + scene→GPU, mas &lt; Dagor (bindump lifecycle, ActionSphere, LOD upgrade, cancel unloadRequested, frame budget). **Não avançar** até ≥95% ou autorização explícita.
-- [ ] Grid de chunks 2D (coordenadas mundiais) — `ChunkCoord` XZ + anéis Chebyshev (~78%; falta ActionSphere/multi-região)
-- [ ] Load/unload assincrono de chunks baseado em distancia — zjobs + histerese (~68%; falta bindump I/O, cancel mid-load, budget µs)
-- [ ] Streaming pool com prioridade (LOD 0 > 1 > 2) — `optima` + concurrent (~62%; **não** re-agenda LOD upgrade em chunks ready)
-- [ ] Double-buffered chunk data — front/back + swap (~60%; GPU upload sync ainda pode stall; cap 64 sem backpressure)
+> **IA2 (2026-07-20, re-audit):** ~**91%** overall — **OK parcial / NOK fase**. ActionSphere+ZoneSet, CHMZ dump load/save, cancel mid-load, frame µs budget, LOD upgrade re-queue, GPU backpressure + upload budget/frame, syncLoadAt. Ainda &lt;95% (falta debug viz zonas, texture-pack delayed load completo, BinaryDump multi-scene holder). **Não avançar** §3.3+; **não** `[x]` até ≥95% ou autorização.
+- [ ] Grid de chunks 2D (coordenadas mundiais) — Chebyshev + **ActionSphere multi-região** (~92%)
+- [ ] Load/unload assincrono de chunks baseado em distancia — zjobs + histerese + **cancel/budget/CHMZ** (~90%)
+- [ ] Streaming pool com prioridade (LOD 0 > 1 > 2) — optima + **LOD upgrade em ready** (~91%)
+- [ ] Double-buffered chunk data — front/back + **GPU upload budget + backpressure** (~90%)
 
 ### 3.2 Terreno
 > **IA2/IA3: OK fase** — overall ~**97%** (≥95%). + parallel unpack, hier incremental, quads/soil/bomb, TFDL net RLE, combined mesh layers. + winding WebGPU, multi-chunk sculpt seams, skirts.

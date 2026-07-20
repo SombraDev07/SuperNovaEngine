@@ -543,6 +543,10 @@ const App = struct {
             self.console.stream_ready = s.streamer.stats.ready;
             self.console.stream_loading = s.streamer.stats.loading;
             self.console.stream_resident = s.streamer.stats.resident;
+            self.console.stream_lod_up = s.streamer.stats.lod_upgrades;
+            self.console.stream_budget_cuts = s.streamer.stats.budget_cuts;
+            self.console.stream_gpu_bp = s.streamer.stats.gpu_backpressure;
+            self.console.stream_zones = @intCast(s.streamer.zones.spheres.items.len);
         }
 
         if (!engine.Renderer.shouldDraw(self.window) or !self.events.shouldDrawApp()) return;

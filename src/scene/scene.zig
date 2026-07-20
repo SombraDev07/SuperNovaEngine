@@ -18,8 +18,19 @@ pub const Scene = struct {
     pub fn create(allocator: std.mem.Allocator, name: []const u8) !Scene {
         const owned_name = try allocator.dupe(u8, name);
         errdefer allocator.free(owned_name);
-        var streamer = try world_stream.Streamer.init(allocator, .{});
+        var streamer = try world_stream.Streamer.init(allocator, .{
+            .dump_root = "assets/world/chunks",
+            .frame_budget_usec = 5000,
+            .max_gpu_ready = 48,
+        });
         errdefer streamer.deinit();
+        // Default authored keep-alive around origin (Dagor ActionSphere role).
+        try streamer.addActionSphere(.{
+            .center = .{ 0, 0, 0 },
+            .load_rad = 96,
+            .unload_rad = 160,
+            .dump_id = 0,
+        });
         var world = try World.init(allocator);
         errdefer world.deinit();
         return .{

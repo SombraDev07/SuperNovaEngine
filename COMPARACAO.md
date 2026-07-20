@@ -2,48 +2,31 @@
 
 ## Streamer (World Streaming)
 
-**Paridade: 65%**
+**Paridade: ~91%** (re-audit 2026-07-20; fase ainda NOK até ≥95%)
 
 ### Componentes presentes
 | Tucano | Dagor |
 |--------|-------|
-| Grid streaming Chebyshev distancia | Sphere streaming ActionSphere (loadRad2 / unloadRad2) |
-| zjobs multi-job concorrente (ate 4) | cpujobs dedicado (single job at a time) |
-| Double-buffered chunks (front/back swap) | Binary dump load/unload lifecycles |
-| Hysteresis: load_radius < unload_radius | Time-budgeted polling (5000us / frame) |
-| Optima priority (near lod0 > far lod2) | `getBinDumpOptima` priority |
-| Stats struct | Debug visualization (colored XZ circles) |
-| 492 LOC em `streamer.zig` | 815 LOC em 4 arquivos |
+| Grid Chebyshev + ActionSphere/ZoneSet | Sphere streaming ActionSphere (loadRad2 / unloadRad2) |
+| zjobs multi-job + cancel mid-load | cpujobs + unloadRequested |
+| Double-buffer front/back + LOD upgrade | Binary dump load/unload + optima re-eval |
+| Hysteresis load/unload + zone keep | loadRad2 / unloadRad2 |
+| Frame budget µs + schedule_budget_ms | usecAllowedPerFrame |
+| CHMZ dump_root load/save on unload | BinaryDump lifecycle |
+| GPU upload budget/frame + backpressure | Delayed tex / resident budget |
+| syncLoadAt / preloadAtPos | readScene / sync bindump |
+| optima(dist, lod) priority | getBinDumpOptima |
 
-### Componentes ausentes
-- ActionSphere zones
-- Binary dump abstraction (Tucano hardcoded para TerrainTile)
-- Sync/foreground loading (`readScene()`)
-- Per-scene / bindump tracking
+### Componentes ausentes / fracos
 - Debug rendering de load / unload zones
-- Texture pack delayed loading integration
-- Dedicated virtual job manager
+- Texture pack delayed loading completo (só hint/backpressure)
+- BinaryDump multi-scene holder (Controller+Manager+SceneHolder)
+- Dedicated virtual job manager (usa zjobs)
 
-### Componentes simplificados
-- Tucano e single-class (Streamer) vs Dagor 2-layer (Controller + Manager + SceneHolder)
-- Tucano usa double-buffering (Dagor usa unloadRequested flag)
-- Tucano usa zjobs library (Dagor implementa o proprio job system)
-
-### Diferencas arquiteturais
-- Tucano e grid-based (Chebyshev). Dagor e sphere-based (ActionSphere com centro + 2 raios).
-- Tucano e concorrente: ate 4 loads em paralelo. Dagor e serial: 1 load por vez.
-- Tucano faz double-buffering (swap atomico sem stall na main thread). Dagor usa flag unloadRequested.
-
-### Diferencas de performance
-- Tucano: concorrencia = maior throughput de carga (4 chunks por tick vs 1 do Dagor)
-- Tucano: double-buffering evita stall no frame quando chunk desaloca
-
-### Plano para atingir 100%
-1. Adicionar ActionSphere abstraction
-2. Implementar binary dump lifecycle
-3. Adicionar sync / foreground loading
-4. Implementar debug visualization dos raios de load / unload
-5. Adicionar texture pack delayed loading
+### Plano para ≥95%
+1. Debug viz dos raios ActionSphere / load rings
+2. Delayed texture-pack path alinhado ao resident budget
+3. SceneHolder / multi-bindump tracking por cena
 
 ---
 

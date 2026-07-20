@@ -9,6 +9,8 @@ pub const terrain_mesh = @import("terrain_mesh.zig");
 pub const terrain_edit = @import("terrain_edit.zig");
 pub const terrain_tile = @import("terrain_tile.zig");
 pub const terraform = @import("terraform.zig");
+pub const zones = @import("zones.zig");
+pub const chunk_storage = @import("chunk_storage.zig");
 
 pub const ChunkCoord = chunk.ChunkCoord;
 pub const LodBand = chunk.LodBand;
@@ -18,6 +20,9 @@ pub const ChunkSlot = chunk.ChunkSlot;
 pub const Streamer = streamer.Streamer;
 pub const StreamerConfig = streamer.Config;
 pub const StreamerStats = streamer.Stats;
+pub const ActionSphere = zones.ActionSphere;
+pub const ZoneSet = zones.ZoneSet;
+pub const ChunkStorage = chunk_storage.ChunkStorage;
 pub const Heightfield = heightfield.Heightfield;
 pub const SplatMap = splat.SplatMap;
 pub const HoleField = holes.HoleField;
@@ -39,4 +44,6 @@ test {
     _ = @import("terrain_edit.zig");
     _ = @import("terrain_tile.zig");
     _ = @import("terraform.zig");
+    _ = @import("zones.zig");
+    _ = @import("chunk_storage.zig");
 }

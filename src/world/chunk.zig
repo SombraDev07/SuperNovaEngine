@@ -59,6 +59,11 @@ pub const LodBand = enum(u8) {
         if (dist <= t2) return .lod1;
         return .lod2;
     }
+
+    /// True if `self` is a finer (higher detail) band than `other`.
+    pub fn isFinerThan(self: LodBand, other: LodBand) bool {
+        return @intFromEnum(self) < @intFromEnum(other);
+    }
 };
 
 pub const ChunkState = enum(u8) {
@@ -93,7 +98,11 @@ pub const ChunkPayload = struct {
 pub const ChunkSlot = struct {
     state: ChunkState = .empty,
     lod: LodBand = .lod2,
+    /// Target LOD from last schedule (Dagor getBinDumpOptima re-eval role).
+    desired_lod: LodBand = .lod2,
     generation: u32 = 0,
+    /// Mid-flight cancel: discard completion and unload (Dagor unloadRequested).
+    unload_requested: bool = false,
     front: ChunkPayload = .{},
     back: ChunkPayload = .{},
 

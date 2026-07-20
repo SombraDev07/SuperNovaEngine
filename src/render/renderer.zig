@@ -819,7 +819,7 @@ pub const Renderer = struct {
         });
     }
 
-    pub fn syncTerrain(self: *Renderer, streamer: *const world.Streamer) !void {
+    pub fn syncTerrain(self: *Renderer, streamer: *world.Streamer) !void {
         self.height_streamer = streamer;
         try self.terrain.sync(self.gctx, streamer);
     }
