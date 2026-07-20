@@ -18,6 +18,7 @@ pub const dds = @import("dds.zig");
 pub const astc = @import("astc.zig");
 pub const shader_hot = @import("shader_hot.zig");
 pub const terrain_splat = @import("terrain_splat.zig");
+pub const gltf_scene = @import("gltf_scene.zig");
 pub const base_pass = @import("base_pass.zig");
 pub const video = @import("video.zig");
 pub const VideoSettings = video.VideoSettings;
@@ -46,4 +47,5 @@ test {
     _ = @import("astc.zig");
     _ = @import("shader_hot.zig");
     _ = @import("terrain_splat.zig");
+    _ = @import("gltf_scene.zig");
 }

@@ -222,6 +222,36 @@ fn destroyTex(gctx: *zgpu.GraphicsContext, t: TexPair) void {
     if (gctx.isResourceValid(t.tex)) gctx.destroyResource(t.tex);
 }
 
+/// Public texture load for glTF / tooling (png/jpg/dds/basis/ktx2/astc).
+pub fn loadTextureFile(
+    gctx: *zgpu.GraphicsContext,
+    allocator: std.mem.Allocator,
+    path_z: [:0]const u8,
+    format: wgpu.TextureFormat,
+) !struct { tex: zgpu.TextureHandle, view: zgpu.TextureViewHandle } {
+    const t = try loadTexture(gctx, allocator, path_z, format);
+    return .{ .tex = t.tex, .view = t.view };
+}
+
+pub fn createSolidRgba(
+    gctx: *zgpu.GraphicsContext,
+    rgba: [4]u8,
+    format: wgpu.TextureFormat,
+) !struct { tex: zgpu.TextureHandle, view: zgpu.TextureViewHandle } {
+    const t = try createSolidColor(gctx, rgba, format);
+    return .{ .tex = t.tex, .view = t.view };
+}
+
+pub fn uploadRgba8Public(
+    gctx: *zgpu.GraphicsContext,
+    pixels: []const [4]u8,
+    width: u32,
+    height: u32,
+    format: wgpu.TextureFormat,
+) zgpu.TextureHandle {
+    return uploadRgba8(gctx, pixels, width, height, format);
+}
+
 fn joinAsset(allocator: std.mem.Allocator, root: []const u8, rel: []const u8) ![:0]u8 {
     return try std.fs.path.joinZ(allocator, &.{ root, rel });
 }

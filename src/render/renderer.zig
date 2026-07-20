@@ -23,6 +23,7 @@ const occlusion = @import("occlusion.zig");
 const shader_hot = @import("shader_hot.zig");
 const terrain_splat = @import("terrain_splat.zig");
 const base_pass_mod = @import("base_pass.zig");
+const gltf_scene = @import("gltf_scene.zig");
 const world = @import("../world/root.zig");
 
 pub const ClearColor = struct {
@@ -128,6 +129,9 @@ pub const Renderer = struct {
     shader_cache: shader.Cache = undefined,
     /// When true, only §1.3 clear+cube path (no deferred stack).
     base_only: bool = false,
+    /// Indoor glTF stress test (Sponza) — no terrain / demo cubes.
+    sponza_mode: bool = false,
+    sponza: ?gltf_scene.Scene = null,
     present_mode: wgpu.PresentMode = .fifo,
     /// Device-lost: set by Dawn callback → skip draw → quit (WebGPU has no in-process reset).
     device_lost: bool = false,
@@ -166,6 +170,7 @@ pub const Renderer = struct {
     pub const CreateOptions = struct {
         present_mode: wgpu.PresentMode = .fifo,
         base_only: bool = false,
+        sponza_mode: bool = false,
     };
 
     pub fn create(allocator: std.mem.Allocator, window: *zglfw.Window, options: CreateOptions) !Renderer {
@@ -196,9 +201,20 @@ pub const Renderer = struct {
             .gctx = gctx,
             .present_mode = options.present_mode,
             .base_only = options.base_only,
+            .sponza_mode = options.sponza_mode,
         };
         const fb = window.getFramebufferSize();
         self.camera.setAspectFromSize(@intCast(fb[0]), @intCast(fb[1]));
+        if (options.sponza_mode) {
+            // Indoor atrium spawn (Khronos Sponza).
+            self.camera.position = zm.f32x4(0.0, 1.7, 0.0, 1);
+            self.camera.yaw = 0.0;
+            self.camera.pitch = 0.0;
+            self.camera.far = 200.0;
+            self.camera.syncLookTarget();
+            self.ibl_intensity = 1.35;
+            self.shadow_max_distance = 80.0;
+        }
 
         self.targets = gbuffer.Targets.create(gctx);
         self.bloom_targets = bloom.Targets.create(gctx);
@@ -820,8 +836,27 @@ pub const Renderer = struct {
     }
 
     pub fn syncTerrain(self: *Renderer, streamer: *world.Streamer) !void {
+        if (self.sponza_mode) return;
         self.height_streamer = streamer;
         try self.terrain.sync(self.gctx, streamer);
+    }
+
+    /// Load Khronos Sponza (or any glTF) for the indoor engine test.
+    pub fn loadSponza(self: *Renderer, path: [:0]const u8) !void {
+        if (self.sponza) |*old| {
+            old.deinit(self.gctx);
+            self.sponza = null;
+        }
+        var scene = try gltf_scene.loadFile(self.gctx, self.allocator, path);
+        scene.createBindGroups(
+            self.gctx,
+            self.gbuffer_bgl,
+            self.gpu_draw.gbuffer_instances,
+            gpu_driven.max_instances * @sizeOf(gpu_driven.InstanceGpu),
+        );
+        self.sponza = scene;
+        self.sponza_mode = true;
+        log.info(.render, "sponza mode ready ({s})", .{path});
     }
 
     /// Dagor workCycle `is_need_to_draw` — skip when minimized / zero framebuffer / unfocused.
@@ -884,6 +919,10 @@ pub const Renderer = struct {
         self.renderables.deinit(self.allocator);
         self.exposure_chain.destroy(self.gctx);
         self.tile_masks.destroy(self.gctx);
+        if (self.sponza) |*s| {
+            s.deinit(self.gctx);
+            self.sponza = null;
+        }
         self.maps.destroy(self.gctx);
         self.point_shadow_maps.destroy(self.gctx);
         self.spot_shadow_maps.destroy(self.gctx);
@@ -1092,13 +1131,17 @@ pub const Renderer = struct {
         };
         const scene_light_count: u32 = 12;
 
-        draw_list.buildDemoRenderables(
-            &self.renderables,
-            self.allocator,
-            self.time,
-            .{ self.metallic, self.roughness, self.ao, 1 },
-            self.height_streamer,
-        ) catch {};
+        if (!self.sponza_mode) {
+            draw_list.buildDemoRenderables(
+                &self.renderables,
+                self.allocator,
+                self.time,
+                .{ self.metallic, self.roughness, self.ao, 1 },
+                self.height_streamer,
+            ) catch {};
+        } else {
+            self.renderables.clearRetainingCapacity();
+        }
         self.visible.rebuild(self.renderables.items, world_to_clip, &self.hiz) catch {};
 
         const index_counts = self.meshIndexCounts();
@@ -1420,8 +1463,20 @@ pub const Renderer = struct {
             .depth_stencil_attachment = &depth_attachment,
         });
         pass.setPipeline(pipeline);
-        self.drawVisibleGBuffer(pass, bind_group);
-        self.terrain.draw(gctx, pass, self.frame.world_to_clip);
+        if (self.sponza_mode) {
+            if (self.sponza) |*scene| {
+                gltf_scene.drawGBuffer(
+                    scene,
+                    gctx,
+                    pass,
+                    self.frame.world_to_clip,
+                    self.gpu_draw.gbuffer_instances,
+                );
+            }
+        } else {
+            self.drawVisibleGBuffer(pass, bind_group);
+            self.terrain.draw(gctx, pass, self.frame.world_to_clip);
+        }
         pass.end();
         pass.release();
     }

@@ -33,8 +33,9 @@ const App = struct {
     look_prev_x: f64 = 0,
     look_prev_y: f64 = 0,
     look_dragging: bool = false,
-    /// Mouse terrain sculpt (LMB drag). Toggle with B.
+    /// Mouse terrain sculpt (LMB drag). Toggle with B. Off in --sponza.
     sculpt_enabled: bool = true,
+    sponza_mode: bool = false,
     sculpt_tool: SculptTool = .raise,
     sculpt_brush: engine.world.Brush = .{ .radius = 8, .strength = 1.2, .falloff = 2 },
     sculpt_paint_layer: u2 = 0,
@@ -246,12 +247,14 @@ const App = struct {
         }
 
         // Keep eye above terrain (avoid flying inside / under the mesh).
-        if (self.scenes.current()) |s| {
-            const wx = cam.position[0];
-            const wz = cam.position[2];
-            const gy = s.streamer.sampleHeight(wx, wz) orelse 0;
-            const min_eye = gy + 2.5;
-            if (cam.position[1] < min_eye) cam.position[1] = min_eye;
+        if (!self.sponza_mode) {
+            if (self.scenes.current()) |s| {
+                const wx = cam.position[0];
+                const wz = cam.position[2];
+                const gy = s.streamer.sampleHeight(wx, wz) orelse 0;
+                const min_eye = gy + 2.5;
+                if (cam.position[1] < min_eye) cam.position[1] = min_eye;
+            }
         }
 
         cam.syncLookTarget();
@@ -646,6 +649,12 @@ pub fn main() !void {
         }
         break :blk false;
     };
+    const sponza_mode = blk: {
+        for (arg_list) |a| {
+            if (std.mem.eql(u8, a, "--sponza")) break :blk true;
+        }
+        break :blk false;
+    };
 
     const window = engine.render.video.createWindow(video) catch |err| {
         engine.log.err(.core, "fatal: video init failed ({s})", .{@errorName(err)});
@@ -660,6 +669,7 @@ pub fn main() !void {
         .renderer = try engine.Renderer.create(allocator, window, .{
             .present_mode = present,
             .base_only = base_only,
+            .sponza_mode = sponza_mode,
         }),
         .scenes = engine.SceneManager.init(),
         .boot_scene = try engine.Scene.create(allocator, "boot"),
@@ -668,6 +678,8 @@ pub fn main() !void {
         .events = engine.EventBus.init(allocator),
         .console = engine.DebugConsole.init(),
         .terrain_editor = engine.world.EditorSession.init(allocator),
+        .sponza_mode = sponza_mode,
+        .sculpt_enabled = !sponza_mode,
     };
     defer {
         zgui.backend.deinit();
@@ -745,7 +757,14 @@ pub fn main() !void {
     app.scenes.select(&app.boot_scene);
     app.scenes.selectSecondary(&app.overlay_scene);
 
-    {
+    if (sponza_mode) {
+        const sponza_path = "assets/models/sponza/Sponza.gltf";
+        app.renderer.loadSponza(sponza_path) catch |err| {
+            engine.log.err(.render, "Sponza load failed ({s}). Run: powershell tools/fetch_sponza.ps1", .{@errorName(err)});
+            return err;
+        };
+        engine.log.info(.core, "Sponza test — WASD/QE fly, RMB look; terrain/sculpt off", .{});
+    } else {
         const cam = app.renderer.camera.position;
         try app.boot_scene.streamer.preloadAtPos(.{ cam[0], cam[1], cam[2] }, 0);
     }
@@ -755,7 +774,7 @@ pub fn main() !void {
         app.overlay_scene.name,
         app.boot_scene.world.entityCount(),
     });
-    engine.log.info(.core, "press ` or F1 for debug console; --base-only for §1.3 path", .{});
+    engine.log.info(.core, "press ` or F1 for debug console; --base-only §1.3; --sponza indoor glTF", .{});
 
     var loop = try engine.GameLoop.init(.{});
     app.loop = &loop;
