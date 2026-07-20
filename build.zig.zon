@@ -86,12 +86,18 @@
             .hash = "N-V-__8AAIz1QAKx8C8vft2YoHjGTjEAkH2QMR2UiAo8xZJ-",
             .lazy = true,
         },
+        .basisu = .{
+            .url = "https://github.com/BinomialLLC/basis_universal/archive/refs/tags/1.16.4.tar.gz",
+            .hash = "N-V-__8AAN5TgQIjz_bVwecblLaOOnK_JIkJ5_btnCkWcOdh",
+        },
     },
     .paths = .{
         "build.zig",
         "build.zig.zon",
         "src",
         "assets",
+        "libs",
+        "tools",
         "ROADMAP.md",
         "README.md",
     },

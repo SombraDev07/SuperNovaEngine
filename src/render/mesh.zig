@@ -5,13 +5,64 @@ pub const Vertex = extern struct {
     position: [3]f32,
     normal: [3]f32,
     color: [3]f32,
+    uv: [2]f32,
 
     pub const attributes = [_]zgpu.wgpu.VertexAttribute{
         .{ .format = .float32x3, .offset = @offsetOf(Vertex, "position"), .shader_location = 0 },
         .{ .format = .float32x3, .offset = @offsetOf(Vertex, "normal"), .shader_location = 1 },
         .{ .format = .float32x3, .offset = @offsetOf(Vertex, "color"), .shader_location = 2 },
+        .{ .format = .float32x2, .offset = @offsetOf(Vertex, "uv"), .shader_location = 3 },
     };
 };
+
+/// Packed terrain vertex (Dagor landMesh int16 role) — 20 B vs 44 B float Vertex (~2.2× VRAM).
+pub const TerrainPackedVertex = extern struct {
+    px: i16,
+    py: i16,
+    pz: i16,
+    _pad0: i16 = 0,
+    nx: i16,
+    ny: i16,
+    nz: i16,
+    _pad1: i16 = 0,
+    u: u16 = 0,
+    v: u16 = 0,
+
+    pub const attributes = [_]zgpu.wgpu.VertexAttribute{
+        .{ .format = .sint16x4, .offset = 0, .shader_location = 0 },
+        .{ .format = .sint16x4, .offset = 8, .shader_location = 1 },
+        .{ .format = .uint16x2, .offset = 16, .shader_location = 2 },
+    };
+};
+
+pub const TerrainDecode = extern struct {
+    origin: [4]f32 = .{ 0, 0, 0, 0 }, // xyz + pad
+    scale: [4]f32 = .{ 1, 1, 1, 0 }, // xyz scale for i16→world
+};
+
+pub fn createGpuTerrainMesh(
+    gctx: *zgpu.GraphicsContext,
+    vertices: []const TerrainPackedVertex,
+    indices: []const u32,
+) Mesh {
+    const vertex_buffer = gctx.createBuffer(.{
+        .usage = .{ .copy_dst = true, .vertex = true },
+        .size = vertices.len * @sizeOf(TerrainPackedVertex),
+    });
+    gctx.queue.writeBuffer(gctx.lookupResource(vertex_buffer).?, 0, TerrainPackedVertex, vertices);
+
+    const index_buffer = gctx.createBuffer(.{
+        .usage = .{ .copy_dst = true, .index = true },
+        .size = indices.len * @sizeOf(u32),
+    });
+    gctx.queue.writeBuffer(gctx.lookupResource(index_buffer).?, 0, u32, indices);
+
+    return .{
+        .vertex_buffer = vertex_buffer,
+        .index_buffer = index_buffer,
+        .index_count = @intCast(indices.len),
+    };
+}
 
 pub const Mesh = struct {
     vertex_buffer: zgpu.BufferHandle,
@@ -43,7 +94,8 @@ pub fn createGpuMesh(
     };
 }
 
-/// Unit cube centered at origin. CCW when viewed from outside; face normals included.
+/// Unit cube centered at origin. Vertex normals point outward; index winding is
+/// CW when viewed from outside so WebGPU LH + `front_face=ccw` keeps exteriors.
 pub fn cubeVertices() [24]Vertex {
     const ldb = [3]f32{ -0.5, -0.5, -0.5 };
     const rdb = [3]f32{ 0.5, -0.5, -0.5 };
@@ -53,6 +105,8 @@ pub fn cubeVertices() [24]Vertex {
     const rdf = [3]f32{ 0.5, -0.5, 0.5 };
     const luf = [3]f32{ -0.5, 0.5, 0.5 };
     const ruf = [3]f32{ 0.5, 0.5, 0.5 };
+
+    const uvs = [_][2]f32{ .{ 0, 1 }, .{ 1, 1 }, .{ 1, 0 }, .{ 0, 0 } };
 
     const faces = [_]struct { n: [3]f32, c: [3]f32, q: [4][3]f32 }{
         .{ .n = .{ 0, 0, 1 }, .c = .{ 0.85, 0.15, 0.12 }, .q = .{ ldf, rdf, ruf, luf } },
@@ -66,8 +120,8 @@ pub fn cubeVertices() [24]Vertex {
     var out: [24]Vertex = undefined;
     var i: usize = 0;
     for (faces) |face| {
-        for (face.q) |p| {
-            out[i] = .{ .position = p, .normal = face.n, .color = face.c };
+        for (face.q, 0..) |p, qi| {
+            out[i] = .{ .position = p, .normal = face.n, .color = face.c, .uv = uvs[qi] };
             i += 1;
         }
     }
@@ -80,33 +134,35 @@ pub fn cubeIndices() [36]u32 {
     var face: u32 = 0;
     while (face < 6) : (face += 1) {
         const b = face * 4;
+        // Reverse of 0,1,2 / 0,2,3 — matches terrain ground winding for this backend.
         out[i + 0] = b + 0;
-        out[i + 1] = b + 1;
-        out[i + 2] = b + 2;
+        out[i + 1] = b + 2;
+        out[i + 2] = b + 1;
         out[i + 3] = b + 0;
-        out[i + 4] = b + 2;
-        out[i + 5] = b + 3;
+        out[i + 4] = b + 3;
+        out[i + 5] = b + 2;
         i += 6;
     }
     return out;
 }
 
-/// Horizontal ground plane (Y-up), size = half-extent on XZ.
+/// Horizontal ground plane (Y-up), size = half-extent on XZ. UVs tile across the plane.
 pub fn planeVertices(half_extent: f32, y: f32) [4]Vertex {
     const e = half_extent;
     const c = [3]f32{ 0.45, 0.47, 0.50 };
     const n = [3]f32{ 0, 1, 0 };
+    const tile: f32 = half_extent;
     return .{
-        .{ .position = .{ -e, y, -e }, .normal = n, .color = c },
-        .{ .position = .{ e, y, -e }, .normal = n, .color = c },
-        .{ .position = .{ e, y, e }, .normal = n, .color = c },
-        .{ .position = .{ -e, y, e }, .normal = n, .color = c },
+        .{ .position = .{ -e, y, -e }, .normal = n, .color = c, .uv = .{ 0, 0 } },
+        .{ .position = .{ e, y, -e }, .normal = n, .color = c, .uv = .{ tile, 0 } },
+        .{ .position = .{ e, y, e }, .normal = n, .color = c, .uv = .{ tile, tile } },
+        .{ .position = .{ -e, y, e }, .normal = n, .color = c, .uv = .{ 0, tile } },
     };
 }
 
 pub fn planeIndices() [6]u32 {
-    // CCW from above (+Y).
-    return .{ 0, 2, 1, 0, 3, 2 };
+    // Front toward +Y when viewed from above (WebGPU LH + ccw front_face).
+    return .{ 0, 1, 2, 0, 2, 3 };
 }
 
 test "cube topology" {
@@ -114,7 +170,7 @@ test "cube topology" {
     try std.testing.expectEqual(@as(usize, 36), cubeIndices().len);
 }
 
-test "cube face winding is outward CCW" {
+test "cube face winding is CW from outside (WebGPU)" {
     const verts = cubeVertices();
     const inds = cubeIndices();
     var face: usize = 0;
@@ -137,7 +193,8 @@ test "cube face winding is outward CCW" {
             (a[1] + b[1] + c[1]) / 3.0,
             (a[2] + b[2] + c[2]) / 3.0,
         };
+        // RH cross points inward; vertex normals stay outward for lighting.
         const outward = n[0] * center[0] + n[1] * center[1] + n[2] * center[2];
-        try std.testing.expect(outward > 0.0);
+        try std.testing.expect(outward < 0.0);
     }
 }

@@ -35,6 +35,15 @@ pub const DebugConsole = struct {
     key_f1_was_down: bool = false,
     fps: f32 = 0,
     frame_dt: f32 = 0,
+    cull_tested: u32 = 0,
+    cull_visible: u32 = 0,
+    cull_occlusion: u32 = 0,
+    stream_ready: u32 = 0,
+    stream_loading: u32 = 0,
+    stream_resident: u32 = 0,
+    /// Optional app command hook (terrain editor, etc.). Return true if handled.
+    command_context: ?*anyopaque = null,
+    command_handler: ?*const fn (ctx: ?*anyopaque, console: *DebugConsole, cmd_line: []const u8) bool = null,
 
     pub fn init() DebugConsole {
         return .{};
@@ -87,6 +96,14 @@ pub const DebugConsole = struct {
         defer zgui.end();
 
         zgui.text("FPS: {d:.1}  dt: {d:.2} ms", .{ self.fps, self.frame_dt * 1000.0 });
+        if (self.cull_tested > 0) {
+            zgui.text("Cull: {d}/{d} visible  occ-{d}", .{ self.cull_visible, self.cull_tested, self.cull_occlusion });
+        }
+        zgui.text("Stream: {d} ready  {d} loading  {d} resident", .{
+            self.stream_ready,
+            self.stream_loading,
+            self.stream_resident,
+        });
         zgui.separator();
 
         const footer_h: f32 = zgui.getFrameHeightWithSpacing() + 8;
@@ -138,7 +155,8 @@ pub const DebugConsole = struct {
         const cmd = it.next() orelse return;
 
         if (std.ascii.eqlIgnoreCase(cmd, "help")) {
-            self.push(.info, "commands: help, clear, fps, quit, log <trace|debug|info|warn|error>");
+            self.push(.info, "commands: help, clear, fps, quit, log <level>");
+            self.push(.info, "terrain: raise|lower|smooth|flatten|hill|undo|redo|paint|hole|bomb|dig|export|import");
         } else if (std.ascii.eqlIgnoreCase(cmd, "clear")) {
             self.clear();
         } else if (std.ascii.eqlIgnoreCase(cmd, "fps")) {
@@ -160,6 +178,10 @@ pub const DebugConsole = struct {
                 self.push(.info, msg);
             } else {
                 self.push(.err, "unknown level");
+            }
+        } else if (self.command_handler) |handler| {
+            if (!handler(self.command_context, self, cmd_line)) {
+                self.push(.err, "unknown command (try 'help')");
             }
         } else {
             self.push(.err, "unknown command (try 'help')");

@@ -1,0 +1,11 @@
+.{
+    .name = "demo_pbr",
+    // Albedo via Basis→BC7 (zbasis); other maps stay PNG for authoring convenience.
+    .albedo = "textures/demo_albedo.basis",
+    .normal = "textures/demo_normal.png",
+    .orm = "textures/demo_orm.png",
+    .emissive = "textures/demo_emissive.png",
+    .metallic = 1.0,
+    .roughness = 1.0,
+    .ao = 1.0,
+}

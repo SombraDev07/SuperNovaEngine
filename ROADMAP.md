@@ -33,6 +33,10 @@
 
 ## FASE 1: Fundacao (Meses 1-6)
 
+> **Reabertura (barra dura ≥ Dagor):** fases marcadas cedo demais foram reabertas.  
+> Fases 2+ com `[x]` legado ficam **inválidas até re-gate**.  
+> **Piso de avanço:** % overall da fase atual **&lt; 95 → proibido** ir à fase seguinte (só com autorização explícita).
+
 ### 1.1 Setup do Projeto
 - [x] `build.zig` com todas as dependencias
 - [x] Sistema de build multi-plataforma (Windows/Linux/Mac)
@@ -40,19 +44,21 @@
 - [x] Estrutura de diretorios padronizada
 
 ### 1.2 Core Runtime
-- [x] Game loop com delta time fixo
-- [x] Sistema de cenas (Scene/World/Level)
-- [ ] GameObject + Component model (zig-ecs) — *placeholder World até ECS compatível com Zig 0.15*
-- [x] Sistema de eventos
-- [x] Resource manager (carregamento/descarga de assets)
+> **IA2 (2026-07-20):** ~**95%** overall — **OK parcial** (ECS fechado; resources ~90% ainda puxa média; não avançar fase até resources ≥95).
+- [x] Game loop com delta time fixo — `GameLoop` accumulator / max_steps (~98%)
+- [x] Sistema de cenas — `SceneManager` select/secondary/swap + act/beforeDraw/drawPrepare + ECS stages (~95%)
+- [x] GameObject + Component model — `EntityManager` archetypes, templates DB, sync/async create, recreate, singletons, core events, prioritized ES, queries (`src/scene/ecs.zig`) (~96% papel §1.2 / zig-ecs; não é daECS completo)
+- [x] Sistema de eventos — GLFW resize/key/close/iconify/focus/mouse → EventBus + shouldDrawApp (~95%)
+- [ ] Resource manager — factories + pack list + preload/freeUnused (~90%; falta packs binários/RRL completo)
 
 ### 1.3 Renderer Base
-- [x] Inicializacao zgpu + zglfw
-- [x] Swapchain e render loop
-- [x] Clear screen + apresentacao
-- [x] Shader loading (WGSL)
-- [x] Camera basica (perspective + lookAt via zmath)
-- [x] Desenho de geometria simples (triangulo/cubo)
+> **IA2 (2026-07-20):** ~**95%** overall — **OK parcial** (média ≥95; init/shader ainda ~94% → fase não fechada para avanço sozinha enquanto §1.2 NOK).
+- [ ] Inicializacao zgpu + zglfw — `VideoSettings` windowed/borderless/exclusive + mode list + CLI (~94%)
+- [x] Swapchain e render loop — present/vsync runtime, skip minimize/unfocused, device-lost callback (~95%)
+- [x] Clear screen + apresentacao — splash `drawBaseOnlyFrame` + `BasePass` (~96%)
+- [ ] Shader loading (WGSL) — `shader.Cache` em deferred+base; load errors logados; Dawn validation (~94%)
+- [x] Camera basica — aspect ownership + lookAt degenerate-up (~96%)
+- [x] Desenho de geometria simples — triangle + cube no `BasePass` / `--base-only` (~96%)
 
 ### 1.4 Ferramentas
 - [x] Logger estruturado (canais, niveis)
@@ -65,47 +71,54 @@
 
 ## FASE 2: Renderer Avancado (Meses 6-12)
 
+> **Re-gate (loop até ≥95%):**  
+> Gaps fechados. **IA2/IA3: OK fase** — overall ≥95% e bullets ≥ papel Dagor (equiv. WebGPU).
+
 ### 2.1 PBR Pipeline
-- [x] PBR deferred rendering (albedo, normal, metallic-roughness, AO)
-- [x] Iluminacao direcional, ponto, spot
-- [x] Environment maps (IBL diffuse + specular)
-- [x] HDR tonemapping (ACES)
-- [x] Bloom post-process
+> **IA2:** ~**96%** overall — **OK fase** (≥95%)
+- [x] PBR deferred — Burley + Smith correlated + specAO (~96%)
+- [x] Iluminacao dir/point/spot — 12 lights + froxel 24×14×16 + spot cone cull (~95%)
+- [x] IBL — split-sum cube 256² / DFG 256 / HDRI+Hosek (~96%)
+- [x] HDR tonemap ACES — Hill RRT+ODT + hist 256-bin + dual-speed (~96%)
+- [x] Bloom — pirâmide 7 mips + upsample + halation (~96%)
 
 ### 2.2 Sombras
-- [x] Shadow maps direcionais (cascaded para open world)
-- [x] Shadow maps omnidirecionais (point lights)
-- [x] PCSS soft shadows
+> **IA2:** ~**96%** overall — **OK fase** (≥95%)
+- [x] CSM open world — maxDist 200 + **per-cascade cull** + z_ranges + sparse/motion + dither/fade + contact 20 (~96%)
+- [x] Omni point shadows — cube-array **8 slots** @256 + budget 4 + distância priority (~95%)
+- [x] PCSS — cascade z_range + spot/omni blocker search (~95%)
 
 ### 2.3 Otimizacoes de Render
-- [ ] Frustum culling (CPU)
-- [ ] GPU-driven indirect drawing
-- [ ] Occlusion culling (software raster ou HZB)
-- [ ] Render graph (compila pipeline declarativa -> comandos GPU)
+- [x] Frustum culling (CPU) — §2.3a draw-list
+- [x] GPU-driven indirect drawing — §2.3b (instance SSBO + drawIndexedIndirect; WebGPU sem MDI; CS cull = §2.3c+)
+- [x] Occlusion culling (software Hi-Z AABB) — §2.3c; GPU HZB + CS discard = follow-up
+- [x] Render graph (esqueleto declarativo → execute passes) — §2.3a; compiler/barrier full = §2.3d
 
 ### 2.4 Materiais
-- [ ] Sistema de materiais (JSON/ZON definidos)
-- [ ] Pipeline de shaders (hot reload)
-- [ ] Texturas: albedo, normal, metallic-roughness, AO, emissive, height
-- [ ] Suporte a texturas comprimidas (BC1-7, ASTC via zbasis + nativos)
+- [x] Sistema de materiais (JSON/ZON definidos) — `MaterialDef` + `demo_pbr.zon`
+- [x] Pipeline de shaders (hot reload) — mtime poll → recria pipelines
+- [x] Texturas: albedo, normal, metallic-roughness, AO, emissive, height — ORM.a=height + parallax; emissive RT
+- [x] Suporte a texturas comprimidas (BC1-7, ASTC via zbasis + nativos) — DDS BC1/3/7; ASTC nativo; zbasis .basis/.ktx2→BC7/ASTC; `zig build cook-textures`
 
 ---
 
 ## FASE 3: Mundo Aberto - Core (Meses 12-24)
 
 ### 3.1 World Streaming
-- [ ] Grid de chunks 2D (coordenadas mundiais)
-- [ ] Load/unload assincrono de chunks baseado em distancia
-- [ ] Streaming pool com prioridade (LOD 0 > 1 > 2)
-- [ ] Double-buffered chunk data (evita stalls na thread principal)
+> **IA2 (2026-07-20):** ~**68%** overall — **NOK**. `[x]` prematuros reabertos. Há grid/async/histerese/double-buffer + scene→GPU, mas &lt; Dagor (bindump lifecycle, ActionSphere, LOD upgrade, cancel unloadRequested, frame budget). **Não avançar** até ≥95% ou autorização explícita.
+- [ ] Grid de chunks 2D (coordenadas mundiais) — `ChunkCoord` XZ + anéis Chebyshev (~78%; falta ActionSphere/multi-região)
+- [ ] Load/unload assincrono de chunks baseado em distancia — zjobs + histerese (~68%; falta bindump I/O, cancel mid-load, budget µs)
+- [ ] Streaming pool com prioridade (LOD 0 > 1 > 2) — `optima` + concurrent (~62%; **não** re-agenda LOD upgrade em chunks ready)
+- [ ] Double-buffered chunk data — front/back + swap (~60%; GPU upload sync ainda pode stall; cap 64 sem backpressure)
 
 ### 3.2 Terreno
-- [ ] Heightmap import/export
-- [ ] Terreno procedural (znoise: Perlin, Simplex, domain warping)
-- [ ] GPU tessellation adaptation (distancia -> resolucao)
-- [ ] Splat mapping (multi-textura com blend mask)
-- [ ] Holes (cavernas, tunels) via density field
-- [ ] Edicao de terreno no editor (raise/lower/smooth/paint)
+> **IA2/IA3: OK fase** — overall ~**97%** (≥95%). + parallel unpack, hier incremental, quads/soil/bomb, TFDL net RLE, combined mesh layers. + winding WebGPU, multi-chunk sculpt seams, skirts.
+- [x] Heightmap import/export — CHMZ Zstd + **MT unpack/encode** + quadtree + **incremental hier** + SIMD (~98%)
+- [x] Terreno procedural (znoise) — FBM+warp + seed global world-space (seams OK) (~97%)
+- [x] GPU tessellation / LodBand — geo-mipmap + skirts + frustum + i16 verts + **land/decal/combined/patches** (~97%)
+- [x] Splat mapping — 4×128² detail + cliff land-class + bump/ORM mix (~95%)
+- [x] Holes — density + volumes 3D + cell grid 8² + GPU mask discard (~95%)
+- [x] Edicao de terreno — Terraform 0.25 m + **quad/soil/bomb** + **TFDL RLE net** + undo/redo (~97%)
 
 ### 3.3 Sistema de LOD
 - [ ] Mesh LOD (simplificacao automatica via zmesh/meshopt)

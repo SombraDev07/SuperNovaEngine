@@ -1,0 +1,42 @@
+pub const chunk = @import("chunk.zig");
+pub const grid = @import("grid.zig");
+pub const streamer = @import("streamer.zig");
+pub const heightfield = @import("heightfield.zig");
+pub const procedural = @import("procedural.zig");
+pub const splat = @import("splat.zig");
+pub const holes = @import("holes.zig");
+pub const terrain_mesh = @import("terrain_mesh.zig");
+pub const terrain_edit = @import("terrain_edit.zig");
+pub const terrain_tile = @import("terrain_tile.zig");
+pub const terraform = @import("terraform.zig");
+
+pub const ChunkCoord = chunk.ChunkCoord;
+pub const LodBand = chunk.LodBand;
+pub const ChunkState = chunk.ChunkState;
+pub const ChunkPayload = chunk.ChunkPayload;
+pub const ChunkSlot = chunk.ChunkSlot;
+pub const Streamer = streamer.Streamer;
+pub const StreamerConfig = streamer.Config;
+pub const StreamerStats = streamer.Stats;
+pub const Heightfield = heightfield.Heightfield;
+pub const SplatMap = splat.SplatMap;
+pub const HoleField = holes.HoleField;
+pub const TerrainTile = terrain_tile.TerrainTile;
+pub const Brush = terrain_edit.Brush;
+pub const EditorSession = terrain_edit.EditorSession;
+pub const Compressed = heightfield.Compressed;
+pub const Terraform = terraform.Terraform;
+
+test {
+    _ = @import("chunk.zig");
+    _ = @import("grid.zig");
+    _ = @import("streamer.zig");
+    _ = @import("heightfield.zig");
+    _ = @import("procedural.zig");
+    _ = @import("splat.zig");
+    _ = @import("holes.zig");
+    _ = @import("terrain_mesh.zig");
+    _ = @import("terrain_edit.zig");
+    _ = @import("terrain_tile.zig");
+    _ = @import("terraform.zig");
+}

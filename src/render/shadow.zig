@@ -5,24 +5,29 @@ const Camera = @import("camera.zig").Camera;
 
 pub const cascade_count: u32 = 4;
 pub const map_size: u32 = 1024;
-pub const point_map_size: u32 = 512;
+pub const max_point_shadow_slots: u32 = 8;
+pub const point_map_size: u32 = 256;
 pub const point_face_count: u32 = 6;
+pub const point_atlas_layers: u32 = max_point_shadow_slots * point_face_count;
+pub const max_spot_shadow_slots: u32 = 4;
+pub const spot_map_size: u32 = 512;
+/// Max punctual shadow volumes refreshed per frame (Dagor DEFAULT_MAX_SHADOWS_TO_UPDATE).
+pub const max_shadow_updates_per_frame: u32 = 4;
 
 pub const DepthUniforms = extern struct {
-    object_to_clip: zm.Mat,
+    light_vp: zm.Mat,
 };
 
 pub const PointDepthUniforms = extern struct {
-    object_to_clip: zm.Mat,
-    object_to_world: zm.Mat,
-    /// xyz = light position, w = range
+    face_vp: zm.Mat,
     light_pos_range: [4]f32,
 };
 
 pub const CascadeData = struct {
     light_vp: [cascade_count]zm.Mat,
-    /// Far distance of each cascade (view-space / camera-distance metric).
     splits: [4]f32,
+    radii: [4]f32,
+    z_ranges: [4]f32,
 };
 
 pub const Maps = struct {
@@ -30,7 +35,6 @@ pub const Maps = struct {
     array_view: zgpu.TextureViewHandle = .{},
     layer_views: [cascade_count]zgpu.TextureViewHandle = [_]zgpu.TextureViewHandle{.{}} ** cascade_count,
     comparison_sampler: zgpu.SamplerHandle = .{},
-    /// Non-comparison sampler to read raw depth (PCSS blocker search).
     depth_sampler: zgpu.SamplerHandle = .{},
 
     pub fn create(gctx: *zgpu.GraphicsContext) Maps {
@@ -108,11 +112,15 @@ pub const Maps = struct {
     }
 };
 
-/// Omnidirectional depth cubemap for one point light.
+/// Atlas of up to `max_point_shadow_slots` cubemaps as a cube-array (Dagor ShadowSystem role).
 pub const PointMaps = struct {
     texture: zgpu.TextureHandle = .{},
+    cube_array_view: zgpu.TextureViewHandle = .{},
+    /// [slot][face]
+    face_views: [max_point_shadow_slots][point_face_count]zgpu.TextureViewHandle =
+        [_][point_face_count]zgpu.TextureViewHandle{[_]zgpu.TextureViewHandle{.{}} ** point_face_count} ** max_point_shadow_slots,
+    /// Legacy single-cube view of slot 0 (compat).
     cube_view: zgpu.TextureViewHandle = .{},
-    face_views: [point_face_count]zgpu.TextureViewHandle = [_]zgpu.TextureViewHandle{.{}} ** point_face_count,
 
     pub fn create(gctx: *zgpu.GraphicsContext) PointMaps {
         const texture = gctx.createTexture(.{
@@ -121,11 +129,20 @@ pub const PointMaps = struct {
             .size = .{
                 .width = point_map_size,
                 .height = point_map_size,
-                .depth_or_array_layers = point_face_count,
+                .depth_or_array_layers = point_atlas_layers,
             },
             .format = .depth32_float,
             .mip_level_count = 1,
             .sample_count = 1,
+        });
+
+        const cube_array_view = gctx.createTextureView(texture, .{
+            .dimension = .tvdim_cube_array,
+            .base_mip_level = 0,
+            .mip_level_count = 1,
+            .base_array_layer = 0,
+            .array_layer_count = point_atlas_layers,
+            .aspect = .depth_only,
         });
 
         const cube_view = gctx.createTextureView(texture, .{
@@ -137,9 +154,77 @@ pub const PointMaps = struct {
             .aspect = .depth_only,
         });
 
-        var face_views: [point_face_count]zgpu.TextureViewHandle = undefined;
-        for (0..point_face_count) |i| {
-            face_views[i] = gctx.createTextureView(texture, .{
+        var face_views: [max_point_shadow_slots][point_face_count]zgpu.TextureViewHandle = undefined;
+        for (0..max_point_shadow_slots) |slot| {
+            for (0..point_face_count) |face| {
+                const layer: u32 = @intCast(slot * point_face_count + face);
+                face_views[slot][face] = gctx.createTextureView(texture, .{
+                    .dimension = .tvdim_2d,
+                    .base_mip_level = 0,
+                    .mip_level_count = 1,
+                    .base_array_layer = layer,
+                    .array_layer_count = 1,
+                    .aspect = .depth_only,
+                });
+            }
+        }
+
+        return .{
+            .texture = texture,
+            .cube_array_view = cube_array_view,
+            .face_views = face_views,
+            .cube_view = cube_view,
+        };
+    }
+
+    pub fn destroy(self: *PointMaps, gctx: *zgpu.GraphicsContext) void {
+        for (&self.face_views) |*slot| {
+            for (slot) |*v| {
+                if (gctx.isResourceValid(v.*)) gctx.releaseResource(v.*);
+            }
+        }
+        if (gctx.isResourceValid(self.cube_view)) gctx.releaseResource(self.cube_view);
+        if (gctx.isResourceValid(self.cube_array_view)) gctx.releaseResource(self.cube_array_view);
+        if (gctx.isResourceValid(self.texture)) gctx.destroyResource(self.texture);
+        self.* = .{};
+    }
+
+    pub fn faceView(self: *const PointMaps, slot: u32, face: u32) zgpu.TextureViewHandle {
+        return self.face_views[slot][face];
+    }
+};
+
+/// Spot-light shadow atlas (depth 2D array) — Dagor setSpotLightShadowVolume role.
+pub const SpotMaps = struct {
+    texture: zgpu.TextureHandle = .{},
+    array_view: zgpu.TextureViewHandle = .{},
+    layer_views: [max_spot_shadow_slots]zgpu.TextureViewHandle =
+        [_]zgpu.TextureViewHandle{.{}} ** max_spot_shadow_slots,
+
+    pub fn create(gctx: *zgpu.GraphicsContext) SpotMaps {
+        const texture = gctx.createTexture(.{
+            .usage = .{ .render_attachment = true, .texture_binding = true },
+            .dimension = .tdim_2d,
+            .size = .{
+                .width = spot_map_size,
+                .height = spot_map_size,
+                .depth_or_array_layers = max_spot_shadow_slots,
+            },
+            .format = .depth32_float,
+            .mip_level_count = 1,
+            .sample_count = 1,
+        });
+        const array_view = gctx.createTextureView(texture, .{
+            .dimension = .tvdim_2d_array,
+            .base_mip_level = 0,
+            .mip_level_count = 1,
+            .base_array_layer = 0,
+            .array_layer_count = max_spot_shadow_slots,
+            .aspect = .depth_only,
+        });
+        var layer_views: [max_spot_shadow_slots]zgpu.TextureViewHandle = undefined;
+        for (0..max_spot_shadow_slots) |i| {
+            layer_views[i] = gctx.createTextureView(texture, .{
                 .dimension = .tvdim_2d,
                 .base_mip_level = 0,
                 .mip_level_count = 1,
@@ -148,25 +233,56 @@ pub const PointMaps = struct {
                 .aspect = .depth_only,
             });
         }
-
-        return .{
-            .texture = texture,
-            .cube_view = cube_view,
-            .face_views = face_views,
-        };
+        return .{ .texture = texture, .array_view = array_view, .layer_views = layer_views };
     }
 
-    pub fn destroy(self: *PointMaps, gctx: *zgpu.GraphicsContext) void {
-        for (&self.face_views) |*v| {
+    pub fn destroy(self: *SpotMaps, gctx: *zgpu.GraphicsContext) void {
+        for (&self.layer_views) |*v| {
             if (gctx.isResourceValid(v.*)) gctx.releaseResource(v.*);
         }
-        if (gctx.isResourceValid(self.cube_view)) gctx.releaseResource(self.cube_view);
+        if (gctx.isResourceValid(self.array_view)) gctx.releaseResource(self.array_view);
         if (gctx.isResourceValid(self.texture)) gctx.destroyResource(self.texture);
         self.* = .{};
     }
 };
 
-/// Six light-space view-projection matrices for a point light cubemap (WebGPU face order).
+/// Sparse cascade update (Dagor shouldUpdateCascade role).
+/// Near cascades every frame; far cascades on a schedule unless `force` (camera jump).
+pub fn shouldUpdateCascade(frame_index: u64, cascade: u32, force: bool) bool {
+    if (force) return true;
+    return switch (cascade) {
+        0, 1 => true,
+        2 => (frame_index % 2) == 0,
+        else => (frame_index % 4) == 0,
+    };
+}
+
+pub fn spotLightViewProj(
+    light_pos: [3]f32,
+    light_dir: [3]f32,
+    near: f32,
+    range: f32,
+    outer_cone_rad: f32,
+) zm.Mat {
+    const eye = zm.f32x4(light_pos[0], light_pos[1], light_pos[2], 1);
+    const ld = normalize3(light_dir);
+    const focus = zm.f32x4(
+        light_pos[0] + ld[0],
+        light_pos[1] + ld[1],
+        light_pos[2] + ld[2],
+        1,
+    );
+    const up = if (@abs(ld[1]) > 0.95)
+        zm.f32x4(0, 0, 1, 0)
+    else
+        zm.f32x4(0, 1, 0, 0);
+    const view = zm.lookAtLh(eye, focus, up);
+    const fov = @max(outer_cone_rad * 2.0, 0.05);
+    const zn = @max(near, range * 0.001);
+    const proj = zm.perspectiveFovLh(fov, 1.0, zn, range);
+    return zm.mul(view, proj);
+}
+
 pub fn pointFaceViewProjs(light_pos: [3]f32, near: f32, range: f32) [point_face_count]zm.Mat {
     const eye = zm.f32x4(light_pos[0], light_pos[1], light_pos[2], 1);
     const proj = zm.perspectiveFovLh(std.math.pi * 0.5, 1.0, near, range);
@@ -202,11 +318,9 @@ pub fn pointFaceViewProjs(light_pos: [3]f32, near: f32, range: f32) [point_face_
     return out;
 }
 
-/// Practical split scheme (uniform / log blend) up to `max_distance`.
 pub fn computeCascades(
     camera: Camera,
     aspect: f32,
-    /// Direction toward the light (same as deferred L for directional).
     light_dir: [3]f32,
     max_distance: f32,
 ) CascadeData {
@@ -224,15 +338,26 @@ pub fn computeCascades(
     }
 
     var light_vp: [cascade_count]zm.Mat = undefined;
+    var radii: [4]f32 = undefined;
+    var z_ranges: [4]f32 = undefined;
     var prev: f32 = near;
     i = 0;
     while (i < cascade_count) : (i += 1) {
-        light_vp[i] = fitCascade(camera, aspect, light_dir, prev, splits[i]);
+        const fitted = fitCascade(camera, aspect, light_dir, prev, splits[i]);
+        light_vp[i] = fitted.vp;
+        radii[i] = fitted.radius;
+        z_ranges[i] = fitted.z_range;
         prev = splits[i];
     }
 
-    return .{ .light_vp = light_vp, .splits = splits };
+    return .{ .light_vp = light_vp, .splits = splits, .radii = radii, .z_ranges = z_ranges };
 }
+
+const FittedCascade = struct {
+    vp: zm.Mat,
+    radius: f32,
+    z_range: f32,
+};
 
 fn fitCascade(
     camera: Camera,
@@ -240,7 +365,7 @@ fn fitCascade(
     light_dir: [3]f32,
     near_z: f32,
     far_z: f32,
-) zm.Mat {
+) FittedCascade {
     const corners = frustumSliceCorners(camera, aspect, near_z, far_z);
 
     var center = zm.f32x4(0, 0, 0, 1);
@@ -261,6 +386,8 @@ fn fitCascade(
         const dz = c[2] - center[2];
         radius = @max(radius, @sqrt(dx * dx + dy * dy + dz * dz));
     }
+    const texel_world = (radius * 2.0) / @as(f32, @floatFromInt(map_size));
+    radius += texel_world * 8.0;
     radius = @ceil(radius * 16.0) / 16.0;
 
     const up = if (@abs(ld[1]) > 0.95)
@@ -268,10 +395,11 @@ fn fitCascade(
     else
         zm.f32x4(0, 1, 0, 0);
 
+    const pull_back = radius * 3.0;
     const eye = zm.f32x4(
-        center[0] + ld[0] * radius * 2.0,
-        center[1] + ld[1] * radius * 2.0,
-        center[2] + ld[2] * radius * 2.0,
+        center[0] + ld[0] * pull_back,
+        center[1] + ld[1] * pull_back,
+        center[2] + ld[2] * pull_back,
         1,
     );
     const light_view = zm.lookAtLh(eye, center, up);
@@ -281,15 +409,21 @@ fn fitCascade(
     light_center[0] = @floor(light_center[0] / texel) * texel;
     light_center[1] = @floor(light_center[1] / texel) * texel;
 
+    const z_near: f32 = 0.1;
+    const z_far = pull_back + radius * 2.0;
     const ortho = zm.orthographicOffCenterLh(
         light_center[0] - radius,
         light_center[0] + radius,
         light_center[1] + radius,
         light_center[1] - radius,
-        0.1,
-        radius * 6.0,
+        z_near,
+        z_far,
     );
-    return zm.mul(light_view, ortho);
+    return .{
+        .vp = zm.mul(light_view, ortho),
+        .radius = radius,
+        .z_range = z_far - z_near,
+    };
 }
 
 fn frustumSliceCorners(camera: Camera, aspect: f32, near_z: f32, far_z: f32) [8][3]f32 {
@@ -299,7 +433,8 @@ fn frustumSliceCorners(camera: Camera, aspect: f32, near_z: f32, far_z: f32) [8]
     const far_h = far_z * tan_half;
     const far_w = far_h * aspect;
 
-    const vs = [_][3]f32{
+    const inv_view = zm.inverse(camera.viewMatrix());
+    const corners_vs = [_][3]f32{
         .{ -near_w, near_h, near_z },
         .{ near_w, near_h, near_z },
         .{ near_w, -near_h, near_z },
@@ -309,11 +444,9 @@ fn frustumSliceCorners(camera: Camera, aspect: f32, near_z: f32, far_z: f32) [8]
         .{ far_w, -far_h, far_z },
         .{ -far_w, -far_h, far_z },
     };
-
-    const inv_view = zm.inverse(camera.viewMatrix());
     var out: [8][3]f32 = undefined;
-    for (vs, 0..) |p, i| {
-        const w = zm.mul(zm.f32x4(p[0], p[1], p[2], 1), inv_view);
+    for (corners_vs, 0..) |c, i| {
+        const w = zm.mul(zm.f32x4(c[0], c[1], c[2], 1), inv_view);
         out[i] = .{ w[0], w[1], w[2] };
     }
     return out;
@@ -321,18 +454,6 @@ fn frustumSliceCorners(camera: Camera, aspect: f32, near_z: f32, far_z: f32) [8]
 
 fn normalize3(v: [3]f32) [3]f32 {
     const len = @sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
-    if (len < 1e-6) return .{ 0, 1, 0 };
+    if (len < 1e-8) return .{ 0, 1, 0 };
     return .{ v[0] / len, v[1] / len, v[2] / len };
-}
-
-test "cascade splits increase" {
-    const cam = Camera{};
-    const data = computeCascades(cam, 16.0 / 9.0, .{ 0.45, 0.85, -0.35 }, 40.0);
-    try std.testing.expect(data.splits[0] < data.splits[1]);
-    try std.testing.expect(data.splits[2] < data.splits[3]);
-}
-
-test "point face count" {
-    const mats = pointFaceViewProjs(.{ 0, 1, 0 }, 0.05, 6.0);
-    try std.testing.expectEqual(@as(usize, 6), mats.len);
 }

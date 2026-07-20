@@ -4,10 +4,15 @@ const zm = @import("zmath");
 pub const Targets = struct {
     albedo: zgpu.TextureHandle = .{},
     albedo_view: zgpu.TextureViewHandle = .{},
+    /// Octahedral normal in RG (unorm).
     normal: zgpu.TextureHandle = .{},
     normal_view: zgpu.TextureViewHandle = .{},
-    world_pos: zgpu.TextureHandle = .{},
-    world_pos_view: zgpu.TextureViewHandle = .{},
+    /// R = metallic, G = roughness, B = flags, A = 1
+    material: zgpu.TextureHandle = .{},
+    material_view: zgpu.TextureViewHandle = .{},
+    /// RGB emissive (sRGB), A unused
+    emissive: zgpu.TextureHandle = .{},
+    emissive_view: zgpu.TextureViewHandle = .{},
     depth: zgpu.TextureHandle = .{},
     depth_view: zgpu.TextureViewHandle = .{},
     hdr: zgpu.TextureHandle = .{},
@@ -21,7 +26,7 @@ pub const Targets = struct {
             .usage = .{ .render_attachment = true, .texture_binding = true },
             .dimension = .tdim_2d,
             .size = .{ .width = w, .height = h, .depth_or_array_layers = 1 },
-            .format = .rgba8_unorm,
+            .format = .rgba8_unorm_srgb,
             .mip_level_count = 1,
             .sample_count = 1,
         });
@@ -29,20 +34,28 @@ pub const Targets = struct {
             .usage = .{ .render_attachment = true, .texture_binding = true },
             .dimension = .tdim_2d,
             .size = .{ .width = w, .height = h, .depth_or_array_layers = 1 },
-            .format = .rgba16_float,
+            .format = .rgba8_unorm,
             .mip_level_count = 1,
             .sample_count = 1,
         });
-        const world_pos = gctx.createTexture(.{
+        const material = gctx.createTexture(.{
             .usage = .{ .render_attachment = true, .texture_binding = true },
             .dimension = .tdim_2d,
             .size = .{ .width = w, .height = h, .depth_or_array_layers = 1 },
-            .format = .rgba16_float,
+            .format = .rgba8_unorm,
+            .mip_level_count = 1,
+            .sample_count = 1,
+        });
+        const emissive = gctx.createTexture(.{
+            .usage = .{ .render_attachment = true, .texture_binding = true },
+            .dimension = .tdim_2d,
+            .size = .{ .width = w, .height = h, .depth_or_array_layers = 1 },
+            .format = .rgba8_unorm_srgb,
             .mip_level_count = 1,
             .sample_count = 1,
         });
         const depth = gctx.createTexture(.{
-            .usage = .{ .render_attachment = true },
+            .usage = .{ .render_attachment = true, .texture_binding = true },
             .dimension = .tdim_2d,
             .size = .{ .width = w, .height = h, .depth_or_array_layers = 1 },
             .format = .depth32_float,
@@ -63,8 +76,10 @@ pub const Targets = struct {
             .albedo_view = gctx.createTextureView(albedo, .{}),
             .normal = normal,
             .normal_view = gctx.createTextureView(normal, .{}),
-            .world_pos = world_pos,
-            .world_pos_view = gctx.createTextureView(world_pos, .{}),
+            .material = material,
+            .material_view = gctx.createTextureView(material, .{}),
+            .emissive = emissive,
+            .emissive_view = gctx.createTextureView(emissive, .{}),
             .depth = depth,
             .depth_view = gctx.createTextureView(depth, .{}),
             .hdr = hdr,
@@ -77,8 +92,10 @@ pub const Targets = struct {
         gctx.destroyResource(self.albedo);
         gctx.releaseResource(self.normal_view);
         gctx.destroyResource(self.normal);
-        gctx.releaseResource(self.world_pos_view);
-        gctx.destroyResource(self.world_pos);
+        gctx.releaseResource(self.material_view);
+        gctx.destroyResource(self.material);
+        gctx.releaseResource(self.emissive_view);
+        gctx.destroyResource(self.emissive);
         gctx.releaseResource(self.depth_view);
         gctx.destroyResource(self.depth);
         gctx.releaseResource(self.hdr_view);
@@ -93,8 +110,6 @@ pub const Targets = struct {
 };
 
 pub const GBufferUniforms = extern struct {
-    object_to_clip: zm.Mat,
-    object_to_world: zm.Mat,
-    /// metallic, roughness, ao, pad
-    material: [4]f32,
+    /// Transposed world→clip (row-vector WGSL).
+    world_to_clip: zm.Mat,
 };
