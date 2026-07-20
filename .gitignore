@@ -1,0 +1,28 @@
+# Zig
+.zig-cache/
+zig-out/
+zig-pkg/
+*.o
+*.obj
+*.exe
+*.pdb
+*.ilk
+
+# Large reference tree (not part of this engine repo)
+DagorEngine/
+
+# IDE
+.idea/
+.vscode/
+*.user
+*.suo
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Local
+*.log
+.env
+.env.*
