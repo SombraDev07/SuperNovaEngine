@@ -26,3 +26,12 @@ Desktop.ini
 *.log
 .env
 .env.*
+
+# Local planning / audit notes (keep README only)
+*.md
+!README.md
+!**/README.md
+.cursor/
+-CRYENGINE-Community-Edition--main/
+tmp_sizes.zig
+src/tmp_sizeof.zig
