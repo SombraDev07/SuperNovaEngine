@@ -24,6 +24,13 @@ const shader_hot = @import("shader_hot.zig");
 const terrain_splat = @import("terrain_splat.zig");
 const base_pass_mod = @import("base_pass.zig");
 const gltf_scene = @import("gltf_scene.zig");
+const atmosphere = @import("atmosphere.zig");
+const rain = @import("rain.zig");
+const gtao = @import("gtao.zig");
+const ddgi = @import("ddgi.zig");
+const ssgi = @import("ssgi.zig");
+const gi_volume = @import("gi_volume.zig");
+const hzb_gpu = @import("hzb_gpu.zig");
 const world = @import("../world/root.zig");
 
 pub const ClearColor = struct {
@@ -69,8 +76,17 @@ pub const Renderer = struct {
     maps: material.Maps = .{},
     tile_masks: lights.TileMaskBuffer = .{},
     exposure_chain: exposure.Chain = .{},
+    atm: atmosphere.System = .{},
+    rain_fx: rain.System = .{},
+    gtao_fx: gtao.System = .{},
+    ddgi_fx: ddgi.System = .{},
+    ssgi_fx: ssgi.System = .{},
+    gi_vol: gi_volume.System = .{},
+    hzb_fx: hzb_gpu.System = .{},
 
     gbuffer_pipeline: zgpu.RenderPipelineHandle = .{},
+    /// No culling — glTF double-sided / Sponza curtains.
+    gbuffer_pipeline_nocull: zgpu.RenderPipelineHandle = .{},
     gbuffer_bgl: zgpu.BindGroupLayoutHandle = .{},
     gbuffer_bg: zgpu.BindGroupHandle = .{},
 
@@ -154,6 +170,12 @@ pub const Renderer = struct {
     bloom_threshold: f32 = 1.0,
     bloom_knee: f32 = 0.5,
     bloom_strength: f32 = 0.65,
+    /// Exposure key (middle grey) / clamps — tuned per scene.
+    exposure_key: f32 = 0.18,
+    exposure_min: f32 = 0.25,
+    exposure_max: f32 = 5.0,
+    /// 0 = ACES Hill, 1 = AgX (Dagon-like natural grade).
+    tonemap_mode: f32 = 0.0,
     shadow_max_distance: f32 = 200.0,
     shadow_depth_bias: f32 = 0.002,
     shadow_normal_bias: f32 = 0.02,
@@ -206,14 +228,23 @@ pub const Renderer = struct {
         const fb = window.getFramebufferSize();
         self.camera.setAspectFromSize(@intCast(fb[0]), @intCast(fb[1]));
         if (options.sponza_mode) {
-            // Indoor atrium spawn (Khronos Sponza).
-            self.camera.position = zm.f32x4(0.0, 1.7, 0.0, 1);
+            // Indoor atrium spawn (Khronos Sponza) — look down the courtyard.
+            self.camera.position = zm.f32x4(0.0, 2.0, 0.0, 1);
             self.camera.yaw = 0.0;
-            self.camera.pitch = 0.0;
+            self.camera.pitch = -0.12;
             self.camera.far = 200.0;
             self.camera.syncLookTarget();
-            self.ibl_intensity = 1.35;
+            // Dagon-like natural look: sun + IBL + AgX (no disco point lights).
+            self.ibl_intensity = 1.85;
             self.shadow_max_distance = 80.0;
+            self.shadow_light_size = 0.28;
+            self.bloom_threshold = 1.35;
+            self.bloom_knee = 0.65;
+            self.bloom_strength = 0.22;
+            self.exposure_key = 0.22;
+            self.exposure_min = 0.35;
+            self.exposure_max = 3.2;
+            self.tonemap_mode = 1.0;
         }
 
         self.targets = gbuffer.Targets.create(gctx);
@@ -237,6 +268,34 @@ pub const Renderer = struct {
         self.gpu_draw = gpu_driven.GpuDriven.create(gctx);
 
         self.shader_cache = shader.Cache.init(allocator, gctx.device);
+        self.atm = try atmosphere.System.create(gctx, &self.shader_cache);
+        if (options.base_only or options.sponza_mode) self.atm.params.enabled = false;
+        if (!options.base_only) {
+            self.rain_fx = rain.System.create(gctx, allocator, &self.shader_cache) catch |err| blk: {
+                log.err(.render, "rain system failed: {s}", .{@errorName(err)});
+                break :blk .{};
+            };
+            self.gtao_fx = gtao.System.create(gctx, &self.shader_cache) catch |err| blk: {
+                log.err(.render, "GTAO system failed: {s}", .{@errorName(err)});
+                break :blk .{};
+            };
+            self.ddgi_fx = ddgi.System.create(gctx, &self.shader_cache) catch |err| blk: {
+                log.err(.render, "DDGI system failed: {s}", .{@errorName(err)});
+                break :blk .{};
+            };
+            self.ssgi_fx = ssgi.System.create(gctx, &self.shader_cache) catch |err| blk: {
+                log.err(.render, "SSGI system failed: {s}", .{@errorName(err)});
+                break :blk .{};
+            };
+            self.gi_vol = gi_volume.System.create(gctx, allocator, &self.shader_cache) catch |err| blk: {
+                log.err(.render, "GI volume (SDF/lit) failed: {s}", .{@errorName(err)});
+                break :blk .{};
+            };
+            self.hzb_fx = hzb_gpu.System.create(gctx, &self.shader_cache) catch |err| blk: {
+                log.err(.render, "HZB GPU failed: {s}", .{@errorName(err)});
+                break :blk .{};
+            };
+        }
 
         try self.initPipelines();
         self.rebuildBindGroups();
@@ -267,6 +326,7 @@ pub const Renderer = struct {
         const gctx = self.gctx;
         const pipes = [_]*zgpu.RenderPipelineHandle{
             &self.gbuffer_pipeline,
+            &self.gbuffer_pipeline_nocull,
             &self.shadow_pipeline,
             &self.point_shadow_pipeline,
             &self.light_pipeline,
@@ -343,7 +403,7 @@ pub const Renderer = struct {
                 .attributes = &mesh.Vertex.attributes,
             }};
 
-            self.gbuffer_pipeline = gctx.createRenderPipeline(gbuffer_pl, .{
+            const gbuffer_desc = wgpu.RenderPipelineDescriptor{
                 .vertex = .{
                     .module = module,
                     .entry_point = "vs_main",
@@ -366,27 +426,33 @@ pub const Renderer = struct {
                     .target_count = targets.len,
                     .targets = &targets,
                 },
-            });
+            };
+            self.gbuffer_pipeline = gctx.createRenderPipeline(gbuffer_pl, gbuffer_desc);
+            var nocull = gbuffer_desc;
+            nocull.primitive.cull_mode = .none;
+            self.gbuffer_pipeline_nocull = gctx.createRenderPipeline(gbuffer_pl, nocull);
         }
 
         // --- Shadow depth ---------------------------------------------------
         self.shadow_bgl = gctx.createBindGroupLayout(&.{
-            zgpu.bufferEntry(0, .{ .vertex = true }, .uniform, true, 0),
-            zgpu.bufferEntry(1, .{ .vertex = true }, .read_only_storage, false, 0),
+            zgpu.bufferEntry(0, .{ .vertex = true, .fragment = true }, .uniform, true, 0),
+            zgpu.bufferEntry(1, .{ .vertex = true, .fragment = true }, .read_only_storage, false, 0),
+            zgpu.samplerEntry(2, .{ .fragment = true }, .filtering),
+            zgpu.textureEntry(3, .{ .fragment = true }, .float, .tvdim_2d, false),
         });
         const shadow_pl = gctx.createPipelineLayout(&.{self.shadow_bgl});
         defer gctx.releaseResource(shadow_pl);
 
         { const module = try self.shader_cache.getOrLoad("assets/shaders/shadow.wgsl"); defer module.release();
 
+            const shadow_attrs = [_]wgpu.VertexAttribute{
+                .{ .format = .float32x3, .offset = @offsetOf(mesh.Vertex, "position"), .shader_location = 0 },
+                .{ .format = .float32x2, .offset = @offsetOf(mesh.Vertex, "uv"), .shader_location = 1 },
+            };
             const vbufs = [_]wgpu.VertexBufferLayout{.{
                 .array_stride = @sizeOf(mesh.Vertex),
-                .attribute_count = 1,
-                .attributes = &[_]wgpu.VertexAttribute{.{
-                    .format = .float32x3,
-                    .offset = @offsetOf(mesh.Vertex, "position"),
-                    .shader_location = 0,
-                }},
+                .attribute_count = shadow_attrs.len,
+                .attributes = &shadow_attrs,
             }};
 
             self.shadow_pipeline = gctx.createRenderPipeline(shadow_pl, .{
@@ -398,7 +464,7 @@ pub const Renderer = struct {
                 },
                 .primitive = .{
                     .front_face = .ccw,
-                    .cull_mode = .front,
+                    .cull_mode = .none,
                     .topology = .triangle_list,
                 },
                 .depth_stencil = &wgpu.DepthStencilState{
@@ -408,6 +474,12 @@ pub const Renderer = struct {
                     .depth_bias = 2,
                     .depth_bias_slope_scale = 1.75,
                     .depth_bias_clamp = 0.0,
+                },
+                .fragment = &wgpu.FragmentState{
+                    .module = module,
+                    .entry_point = "fs_main",
+                    .target_count = 0,
+                    .targets = null,
                 },
             });
         }
@@ -477,6 +549,13 @@ pub const Renderer = struct {
             zgpu.bufferEntry(14, .{ .fragment = true }, .read_only_storage, false, 0),
             zgpu.textureEntry(15, .{ .fragment = true }, .float, .tvdim_2d, false),
             zgpu.textureEntry(16, .{ .fragment = true }, .depth, .tvdim_2d_array, false),
+            zgpu.textureEntry(17, .{ .fragment = true }, .float, .tvdim_2d, false),
+            zgpu.textureEntry(18, .{ .fragment = true }, .float, .tvdim_2d, false),
+            zgpu.samplerEntry(19, .{ .fragment = true }, .filtering),
+            zgpu.textureEntry(20, .{ .fragment = true }, .float, .tvdim_2d, false),
+            zgpu.textureEntry(21, .{ .fragment = true }, .float, .tvdim_2d, false),
+            zgpu.textureEntry(22, .{ .fragment = true }, .float, .tvdim_2d, false),
+            zgpu.textureEntry(23, .{ .fragment = true }, .float, .tvdim_2d, false), // GTAO
         });
         const light_pl = gctx.createPipelineLayout(&.{self.light_bgl});
         defer gctx.releaseResource(light_pl);
@@ -755,30 +834,82 @@ pub const Renderer = struct {
         self.shadow_bg = gctx.createBindGroup(self.shadow_bgl, &.{
             .{ .binding = 0, .buffer_handle = gctx.uniforms.buffer, .offset = 0, .size = @sizeOf(shadow.DepthUniforms) },
             .{ .binding = 1, .buffer_handle = self.gpu_draw.shadow_instances, .offset = 0, .size = gpu_driven.max_instances * @sizeOf(gpu_driven.InstanceGpu) },
+            .{ .binding = 2, .sampler_handle = self.maps.sampler },
+            .{ .binding = 3, .texture_view_handle = self.maps.albedo_view },
         });
         self.point_shadow_bg = gctx.createBindGroup(self.point_shadow_bgl, &.{
             .{ .binding = 0, .buffer_handle = gctx.uniforms.buffer, .offset = 0, .size = @sizeOf(shadow.PointDepthUniforms) },
             .{ .binding = 1, .buffer_handle = self.gpu_draw.shadow_instances, .offset = 0, .size = gpu_driven.max_instances * @sizeOf(gpu_driven.InstanceGpu) },
         });
-        self.light_bg = gctx.createBindGroup(self.light_bgl, &.{
-            .{ .binding = 0, .buffer_handle = gctx.uniforms.buffer, .offset = 0, .size = @sizeOf(lights.FrameUniforms) },
-            .{ .binding = 1, .sampler_handle = self.sampler },
-            .{ .binding = 2, .texture_view_handle = self.targets.albedo_view },
-            .{ .binding = 3, .texture_view_handle = self.targets.normal_view },
-            .{ .binding = 4, .texture_view_handle = self.targets.material_view },
-            .{ .binding = 5, .texture_view_handle = self.targets.depth_view },
-            .{ .binding = 6, .texture_view_handle = self.env.cubemap_view },
-            .{ .binding = 7, .sampler_handle = self.env.sampler },
-            .{ .binding = 8, .texture_view_handle = self.env.dfg_view },
-            .{ .binding = 9, .sampler_handle = self.env.dfg_sampler },
-            .{ .binding = 10, .texture_view_handle = self.shadow_maps.array_view },
-            .{ .binding = 11, .sampler_handle = self.shadow_maps.comparison_sampler },
-            .{ .binding = 12, .sampler_handle = self.shadow_maps.depth_sampler },
-            .{ .binding = 13, .texture_view_handle = self.point_shadow_maps.cube_array_view },
-            .{ .binding = 14, .buffer_handle = self.tile_masks.buffer, .offset = 0, .size = lights.tile_count * @sizeOf(u32) },
-            .{ .binding = 15, .texture_view_handle = self.targets.emissive_view },
-            .{ .binding = 16, .texture_view_handle = self.spot_shadow_maps.array_view },
-        });
+        if (self.rain_fx.ready) {
+            self.rain_fx.rebuildBindGroup(gctx, self.targets.depth_view, self.targets.normal_view);
+        }
+        if (self.gtao_fx.ready) {
+            self.gtao_fx.rebuildBindGroups(gctx, self.targets.depth_view, self.targets.normal_view);
+        }
+        if (self.hzb_fx.ready) {
+            self.hzb_fx.rebuildBindGroups(gctx, self.targets.depth_view);
+        }
+        if (self.gi_vol.ready) {
+            const prev_hdr = if (self.ddgi_fx.ready)
+                (if (gctx.isResourceValid(self.ddgi_fx.prev_hdr_view)) self.ddgi_fx.prev_hdr_view else self.ddgi_fx.white_view)
+            else
+                self.targets.albedo_view;
+            self.gi_vol.rebuildBindGroups(
+                gctx,
+                self.targets.depth_view,
+                self.targets.albedo_view,
+                self.targets.normal_view,
+                prev_hdr,
+            );
+            if (self.ddgi_fx.ready) {
+                const pack = self.gi_vol.packing();
+                self.ddgi_fx.setVolume(
+                    self.gi_vol.sdfView(),
+                    self.gi_vol.litView(),
+                    self.gi_vol.albedoView(),
+                    pack.clip0,
+                    pack.clip1,
+                    pack.clip2,
+                    pack.clip3,
+                    pack.dims,
+                    pack.atlas,
+                );
+            }
+        }
+        if (self.ddgi_fx.ready) {
+            const gtao_v = if (self.gtao_fx.ready) self.gtao_fx.outputView() else self.targets.albedo_view;
+            self.ddgi_fx.rebuildBindGroup(
+                gctx,
+                self.targets.depth_view,
+                self.targets.albedo_view,
+                self.targets.normal_view,
+                self.targets.material_view,
+                gtao_v,
+                self.env.cubemap_view,
+                self.env.sampler,
+            );
+        }
+        if (self.ssgi_fx.ready) {
+            if (self.hzb_fx.ready) self.ssgi_fx.setHzb(self.hzb_fx.viewMip(1));
+            const gtao_v = if (self.gtao_fx.ready) self.gtao_fx.outputView() else self.targets.albedo_view;
+            const prev_hdr = if (self.ddgi_fx.ready)
+                (if (gctx.isResourceValid(self.ddgi_fx.prev_hdr_view)) self.ddgi_fx.prev_hdr_view else self.ddgi_fx.white_view)
+            else
+                self.targets.albedo_view;
+            self.ssgi_fx.rebuildBindGroup(
+                gctx,
+                self.targets.depth_view,
+                self.targets.normal_view,
+                self.targets.albedo_view,
+                self.targets.material_view,
+                gtao_v,
+                prev_hdr,
+                self.env.cubemap_view,
+                self.env.sampler,
+            );
+        }
+        self.refreshLightBindGroup();
         self.bloom_extract_bg = gctx.createBindGroup(self.bloom_extract_bgl, &.{
             .{ .binding = 0, .buffer_handle = gctx.uniforms.buffer, .offset = 0, .size = @sizeOf(bloom.ExtractUniforms) },
             .{ .binding = 1, .sampler_handle = self.sampler },
@@ -835,6 +966,251 @@ pub const Renderer = struct {
         });
     }
 
+    /// Lighting BG must refresh when GTAO history ping-pongs or cloud TAA flips.
+    fn refreshLightBindGroup(self: *Renderer) void {
+        const gctx = self.gctx;
+        if (gctx.isResourceValid(self.light_bg)) gctx.releaseResource(self.light_bg);
+        self.light_bg = gctx.createBindGroup(self.light_bgl, &.{
+            .{ .binding = 0, .buffer_handle = gctx.uniforms.buffer, .offset = 0, .size = @sizeOf(lights.FrameUniforms) },
+            .{ .binding = 1, .sampler_handle = self.sampler },
+            .{ .binding = 2, .texture_view_handle = self.targets.albedo_view },
+            .{ .binding = 3, .texture_view_handle = self.targets.normal_view },
+            .{ .binding = 4, .texture_view_handle = self.targets.material_view },
+            .{ .binding = 5, .texture_view_handle = self.targets.depth_view },
+            .{ .binding = 6, .texture_view_handle = self.env.cubemap_view },
+            .{ .binding = 7, .sampler_handle = self.env.sampler },
+            .{ .binding = 8, .texture_view_handle = self.env.dfg_view },
+            .{ .binding = 9, .sampler_handle = self.env.dfg_sampler },
+            .{ .binding = 10, .texture_view_handle = self.shadow_maps.array_view },
+            .{ .binding = 11, .sampler_handle = self.shadow_maps.comparison_sampler },
+            .{ .binding = 12, .sampler_handle = self.shadow_maps.depth_sampler },
+            .{ .binding = 13, .texture_view_handle = self.point_shadow_maps.cube_array_view },
+            .{ .binding = 14, .buffer_handle = self.tile_masks.buffer, .offset = 0, .size = lights.tile_count * @sizeOf(u32) },
+            .{ .binding = 15, .texture_view_handle = self.targets.emissive_view },
+            .{ .binding = 16, .texture_view_handle = self.spot_shadow_maps.array_view },
+            .{ .binding = 17, .texture_view_handle = self.atm.skyview_view },
+            .{ .binding = 18, .texture_view_handle = self.atm.transmittance_view },
+            .{ .binding = 19, .sampler_handle = self.atm.sampler },
+            .{ .binding = 20, .texture_view_handle = self.atm.cloudTaaView() },
+            .{ .binding = 21, .texture_view_handle = self.atm.cloud_shadow_view },
+            .{ .binding = 22, .texture_view_handle = self.atm.rain_map_view },
+            .{ .binding = 23, .texture_view_handle = if (self.gtao_fx.ready)
+                self.gtao_fx.outputView()
+            else
+                self.targets.albedo_view },
+        });
+    }
+
+    fn passGtao(self: *Renderer) void {
+        if (!self.gtao_fx.ready) return;
+        const encoder = self.frame.encoder orelse return;
+        // Stable final RT — do NOT rebuild light_bg here (in-flight GPU use → device lost).
+        self.gtao_fx.draw(
+            self.gctx,
+            encoder,
+            self.frame.view,
+            self.frame.inv_view_proj,
+            self.frame.world_to_clip,
+            self.camera.fov_y,
+            self.camera.near,
+            self.camera.far,
+        );
+    }
+
+    fn passHzb(self: *Renderer) void {
+        if (!self.hzb_fx.ready) return;
+        const encoder = self.frame.encoder orelse return;
+        self.hzb_fx.build(self.gctx, encoder);
+    }
+
+    fn passGiVolume(self: *Renderer) void {
+        if (!self.gi_vol.ready) return;
+        const encoder = self.frame.encoder orelse return;
+        const gctx = self.gctx;
+        const cam = self.frame.cam_pos;
+        var sun_dir: [3]f32 = .{ 0.35, 0.85, 0.2 };
+        var sun_col: [3]f32 = .{ 1.0, 0.96, 0.9 };
+        var sun_int: f32 = 3.5;
+        for (self.frame.scene_lights[0..self.frame.scene_light_count]) |L| {
+            if (L.kind == .directional) {
+                sun_dir = L.position_or_direction;
+                sun_col = L.color;
+                sun_int = L.intensity;
+                break;
+            }
+        }
+        if (self.atm.params.enabled) {
+            sun_dir = self.atm.sun_dir;
+            sun_int = self.atm.sun_illuminance;
+        }
+        const amb: f32 = if (self.sponza_mode) 0.12 else 0.06;
+        if (self.hzb_fx.ready) self.gi_vol.setHzb(self.hzb_fx.viewMip(1));
+        self.gi_vol.beginFrame(gctx, .{ cam[0], cam[1], cam[2] });
+        self.gi_vol.dispatch(
+            gctx,
+            encoder,
+            .{ cam[0], cam[1], cam[2] },
+            self.frame.inv_view_proj,
+            self.frame.world_to_clip,
+            sun_dir,
+            sun_col,
+            sun_int,
+            amb,
+            gctx.swapchain_descriptor.width,
+            gctx.swapchain_descriptor.height,
+        );
+        // Keep DDGI volume uniforms in sync each frame (origins move).
+        if (self.ddgi_fx.ready) {
+            const pack = self.gi_vol.packing();
+            self.ddgi_fx.setVolume(
+                self.gi_vol.sdfView(),
+                self.gi_vol.litView(),
+                self.gi_vol.albedoView(),
+                pack.clip0,
+                pack.clip1,
+                pack.clip2,
+                pack.clip3,
+                pack.dims,
+                pack.atlas,
+            );
+        }
+    }
+
+    fn passDdgi(self: *Renderer) void {
+        if (!self.ddgi_fx.ready) return;
+        const encoder = self.frame.encoder orelse return;
+        const gctx = self.gctx;
+        const cam = self.frame.cam_pos;
+        // Sun from scene lights (first directional) or atmosphere.
+        var sun_dir: [3]f32 = .{ 0.35, 0.85, 0.2 };
+        var sun_col: [3]f32 = .{ 1.0, 0.96, 0.9 };
+        var sun_int: f32 = 3.5;
+        for (self.frame.scene_lights[0..self.frame.scene_light_count]) |L| {
+            if (L.kind == .directional) {
+                sun_dir = L.position_or_direction;
+                sun_col = L.color;
+                sun_int = L.intensity;
+                break;
+            }
+        }
+        if (self.atm.params.enabled) {
+            sun_dir = self.atm.sun_dir;
+            sun_int = self.atm.sun_illuminance;
+        }
+        const amb: f32 = if (self.sponza_mode) 0.12 else 0.06;
+        self.ddgi_fx.draw(
+            gctx,
+            encoder,
+            .{ cam[0], cam[1], cam[2] },
+            self.frame.view,
+            self.frame.inv_view_proj,
+            self.frame.world_to_clip,
+            sun_dir,
+            sun_col,
+            sun_int,
+            amb,
+            self.camera.near,
+            self.camera.far,
+            gctx.swapchain_descriptor.width,
+            gctx.swapchain_descriptor.height,
+        );
+    }
+
+    fn passDdgiApply(self: *Renderer) void {
+        if (!self.ddgi_fx.ready) return;
+        const encoder = self.frame.encoder orelse return;
+        const cam = self.frame.cam_pos;
+        self.ddgi_fx.apply(
+            self.gctx,
+            encoder,
+            self.targets.hdr_view,
+            self.frame.inv_view_proj,
+            .{ cam[0], cam[1], cam[2] },
+        );
+    }
+
+    fn passSsgi(self: *Renderer) void {
+        if (!self.ssgi_fx.ready) return;
+        const encoder = self.frame.encoder orelse return;
+        const gctx = self.gctx;
+        const cam = self.frame.cam_pos;
+        var sun_dir: [3]f32 = .{ 0.35, 0.85, 0.2 };
+        var sun_col: [3]f32 = .{ 1.0, 0.96, 0.9 };
+        var sun_int: f32 = 3.5;
+        for (self.frame.scene_lights[0..self.frame.scene_light_count]) |L| {
+            if (L.kind == .directional) {
+                sun_dir = L.position_or_direction;
+                sun_col = L.color;
+                sun_int = L.intensity;
+                break;
+            }
+        }
+        if (self.atm.params.enabled) {
+            sun_dir = self.atm.sun_dir;
+            sun_int = self.atm.sun_illuminance;
+        }
+        const amb: f32 = if (self.sponza_mode) 0.12 else 0.06;
+        self.ssgi_fx.draw(
+            gctx,
+            encoder,
+            .{ cam[0], cam[1], cam[2] },
+            self.frame.inv_view_proj,
+            self.frame.world_to_clip,
+            sun_dir,
+            sun_col,
+            sun_int,
+            amb,
+            self.camera.near,
+            self.camera.far,
+            gctx.swapchain_descriptor.width,
+            gctx.swapchain_descriptor.height,
+        );
+    }
+
+    fn passSsgiApply(self: *Renderer) void {
+        if (!self.ssgi_fx.ready) return;
+        const encoder = self.frame.encoder orelse return;
+        self.ssgi_fx.apply(
+            self.gctx,
+            encoder,
+            self.targets.hdr_view,
+            self.frame.inv_view_proj,
+        );
+    }
+
+    fn passRain(self: *Renderer) void {
+        if (!self.rain_fx.ready) return;
+        const encoder = self.frame.encoder orelse return;
+        const gctx = self.gctx;
+        self.rain_fx.controller.update(self.frame.dt);
+        if (self.rain_fx.controller.sync_atmosphere) {
+            self.atm.params.rain = self.rain_fx.controller.intensity;
+        }
+        var wind_xz = self.atm.params.wind_dir;
+        const wlen = @sqrt(wind_xz[0] * wind_xz[0] + wind_xz[1] * wind_xz[1]);
+        if (wlen > 1e-5) {
+            wind_xz[0] /= wlen;
+            wind_xz[1] /= wlen;
+        }
+        wind_xz[0] *= self.atm.params.wind_speed;
+        wind_xz[1] *= self.atm.params.wind_speed;
+        const cam = self.frame.cam_pos;
+        self.rain_fx.draw(
+            gctx,
+            encoder,
+            self.targets.hdr_view,
+            wind_xz,
+            .{ cam[0], cam[1], cam[2] },
+            self.frame.inv_view_proj,
+            self.frame.world_to_clip,
+            self.camera.near,
+            self.camera.far,
+            self.frame.dt,
+            gctx.swapchain_descriptor.width,
+            gctx.swapchain_descriptor.height,
+        );
+    }
+
     pub fn syncTerrain(self: *Renderer, streamer: *world.Streamer) !void {
         if (self.sponza_mode) return;
         self.height_streamer = streamer;
@@ -848,21 +1224,31 @@ pub const Renderer = struct {
             self.sponza = null;
         }
         var scene = try gltf_scene.loadFile(self.gctx, self.allocator, path);
+        const inst_bytes = gpu_driven.max_instances * @sizeOf(gpu_driven.InstanceGpu);
         scene.createBindGroups(
             self.gctx,
             self.gbuffer_bgl,
+            self.shadow_bgl,
             self.gpu_draw.gbuffer_instances,
-            gpu_driven.max_instances * @sizeOf(gpu_driven.InstanceGpu),
+            self.gpu_draw.shadow_instances,
+            inst_bytes,
         );
         self.sponza = scene;
         self.sponza_mode = true;
-        log.info(.render, "sponza mode ready ({s})", .{path});
+        // Dry atrium by default (natural daylight look). Toggle rain in debug UI if needed.
+        if (self.rain_fx.ready) {
+            self.rain_fx.controller.enabled = false;
+            self.rain_fx.controller.wetness = 0.0;
+            self.rain_fx.controller.stop();
+        }
+        log.info(.render, "sponza mode ready ({s}) — sun+IBL+AgX natural look", .{path});
     }
 
-    /// Dagor workCycle `is_need_to_draw` — skip when minimized / zero framebuffer / unfocused.
+    /// Dagor workCycle `is_need_to_draw` — skip only when minimized / zero framebuffer.
+    /// Still draw when unfocused: otherwise Start-Process / click-to-focus shows a black
+    /// window, and the first focused frame can TDR/crash (looks like “click closes app”).
     pub fn shouldDraw(window: *zglfw.Window) bool {
         if (window.getAttribute(.iconified)) return false;
-        if (!window.getAttribute(.focused)) return false;
         const fb = window.getFramebufferSize();
         return fb[0] > 0 and fb[1] > 0;
     }
@@ -906,6 +1292,13 @@ pub const Renderer = struct {
         self.device_lost = true;
         const msg = if (message) |m| std.mem.span(m) else "unknown";
         log.err(.render, "device lost reason={s}: {s} (restart required)", .{ @tagName(reason), msg });
+        // Persist for post-mortem when the console window vanishes.
+        if (std.fs.cwd().createFile("device_lost.log", .{})) |f| {
+            defer f.close();
+            var buf: [512]u8 = undefined;
+            const line = std.fmt.bufPrint(&buf, "device lost reason={s}: {s}\n", .{ @tagName(reason), msg }) catch return;
+            f.writeAll(line) catch {};
+        } else |_| {}
     }
 
     pub fn destroy(self: *Renderer) void {
@@ -919,6 +1312,13 @@ pub const Renderer = struct {
         self.renderables.deinit(self.allocator);
         self.exposure_chain.destroy(self.gctx);
         self.tile_masks.destroy(self.gctx);
+        self.atm.destroy(self.gctx);
+        self.rain_fx.destroy(self.gctx);
+        self.gtao_fx.destroy(self.gctx);
+        self.ddgi_fx.destroy(self.gctx);
+        self.ssgi_fx.destroy(self.gctx);
+        self.gi_vol.destroy(self.gctx);
+        self.hzb_fx.destroy(self.gctx);
         if (self.sponza) |*s| {
             s.deinit(self.gctx);
             self.sponza = null;
@@ -1024,112 +1424,137 @@ pub const Renderer = struct {
         const world_to_clip = self.camera.viewProjectionOwned();
         const inv_view_proj = zm.inverse(world_to_clip);
 
-        const sun_dir = [3]f32{ 0.45, 0.85, -0.35 };
+        // Day/night: advance TOD outdoors (~1 min real = 1 game hour at 60fps×dt).
+        if (!self.sponza_mode and self.atm.params.enabled) {
+            self.atm.advanceTime(dt * (1.0 / 60.0)); // ~1h per real minute
+            self.atm.updateAstronomy();
+        }
+        const sun_dir: [3]f32 = if (self.sponza_mode)
+            .{ 0.42, 0.88, -0.22 } // afternoon slant through open roof
+        else if (self.atm.params.enabled)
+            self.atm.dominantLightDir()
+        else
+            .{ 0.45, 0.85, -0.35 };
         const cascades = shadow.computeCascades(self.camera, aspect, sun_dir, self.shadow_max_distance);
 
         const cam_pos = self.camera.position;
-        const ground0: f32 = if (self.height_streamer) |s| s.sampleHeight(0, 0) orelse 0 else 0;
-        const orbit_r: f32 = 2.2;
-        const point_pos = [3]f32{
-            @cos(self.time * 1.1) * orbit_r,
-            ground0 + 0.6 + 0.25 * @sin(self.time * 2.0),
-            @sin(self.time * 1.1) * orbit_r,
-        };
+        const ground0: f32 = if (self.sponza_mode) 0.0 else if (self.height_streamer) |s| s.sampleHeight(0, 0) orelse 0 else 0;
+        var point_pos: [3]f32 = .{ 0, ground0 + 1.0, 0 };
 
         var scene_lights: [16]lights.Light = [_]lights.Light{.{}} ** 16;
         scene_lights[0] = .{
             .kind = .directional,
             .position_or_direction = sun_dir,
-            .color = .{ 1.0, 0.96, 0.90 },
-            .intensity = 2.2,
+            .color = if (self.sponza_mode)
+                .{ 1.0, 0.93, 0.82 } // warm daylight
+            else if (!self.atm.params.enabled)
+                .{ 1.0, 0.96, 0.90 }
+            else
+                self.atm.sun_color,
+            .intensity = if (self.sponza_mode)
+                6.5
+            else if (self.atm.params.enabled)
+                self.atm.directionalIntensity() * self.atm.queryCloudShadowAt(cam_pos[0], cam_pos[2])
+            else
+                2.2,
         };
-        scene_lights[1] = .{
-            .kind = .point,
-            .position_or_direction = point_pos,
-            .color = .{ 0.35, 0.75, 1.0 },
-            .intensity = 8.0,
-            .range = 6.0,
-        };
-        scene_lights[2] = .{
-            .kind = .spot,
-            .position_or_direction = .{ -1.8, ground0 + 2.5, -1.5 },
-            .spot_direction = .{ 0.45, -1.0, 0.35 },
-            .color = .{ 1.0, 0.55, 0.20 },
-            .intensity = 18.0,
-            .range = 10.0,
-            .inner_cone = std.math.degreesToRadians(12.0),
-            .outer_cone = std.math.degreesToRadians(28.0),
-        };
-        scene_lights[3] = .{
-            .kind = .point,
-            .position_or_direction = .{ 3.5, ground0 + 1.2, -2.0 },
-            .color = .{ 1.0, 0.3, 0.4 },
-            .intensity = 5.0,
-            .range = 8.0,
-        };
-        scene_lights[4] = .{
-            .kind = .point,
-            .position_or_direction = .{ -3.0, ground0 + 0.8, 2.5 },
-            .color = .{ 0.3, 1.0, 0.5 },
-            .intensity = 4.5,
-            .range = 7.0,
-        };
-        scene_lights[5] = .{
-            .kind = .point,
-            .position_or_direction = .{ 0.0, ground0 + 2.0, 4.0 },
-            .color = .{ 0.9, 0.9, 0.4 },
-            .intensity = 3.5,
-            .range = 9.0,
-        };
-        scene_lights[6] = .{
-            .kind = .spot,
-            .position_or_direction = .{ 2.5, ground0 + 3.0, 2.0 },
-            .spot_direction = .{ -0.3, -1.0, -0.2 },
-            .color = .{ 0.6, 0.8, 1.0 },
-            .intensity = 12.0,
-            .range = 12.0,
-            .inner_cone = std.math.degreesToRadians(10.0),
-            .outer_cone = std.math.degreesToRadians(24.0),
-        };
-        scene_lights[7] = .{
-            .kind = .point,
-            .position_or_direction = .{ -1.5, ground0 + 0.5, -3.5 },
-            .color = .{ 0.8, 0.4, 1.0 },
-            .intensity = 4.0,
-            .range = 6.5,
-        };
-        scene_lights[8] = .{
-            .kind = .point,
-            .position_or_direction = .{ 4.0, ground0 + 0.7, 1.0 },
-            .color = .{ 1.0, 0.7, 0.3 },
-            .intensity = 3.5,
-            .range = 5.5,
-        };
-        scene_lights[9] = .{
-            .kind = .point,
-            .position_or_direction = .{ -4.0, ground0 + 1.5, -1.0 },
-            .color = .{ 0.4, 0.6, 1.0 },
-            .intensity = 3.0,
-            .range = 7.0,
-        };
-        scene_lights[10] = .{
-            .kind = .point,
-            .position_or_direction = .{ 1.5, ground0 + 0.4, -4.5 },
-            .color = .{ 0.9, 0.2, 0.6 },
-            .intensity = 3.2,
-            .range = 5.0,
-        };
-        scene_lights[11] = .{
-            .kind = .spot,
-            .position_or_direction = .{ 0.0, ground0 + 4.0, 0.0 },
-            .spot_direction = .{ 0.1, -1.0, 0.1 },
-            .color = .{ 1.0, 0.95, 0.85 },
-            .intensity = 14.0,
-            .range = 14.0,
-            .inner_cone = std.math.degreesToRadians(8.0),
-            .outer_cone = std.math.degreesToRadians(22.0),
-        };
-        const scene_light_count: u32 = 12;
+        var scene_light_count: u32 = 1;
+        if (!self.sponza_mode) {
+            const orbit_r: f32 = 2.2;
+            const point_y_base: f32 = 0.6;
+            point_pos = .{
+                @cos(self.time * 1.1) * orbit_r,
+                ground0 + point_y_base + 0.25 * @sin(self.time * 2.0),
+                @sin(self.time * 1.1) * orbit_r,
+            };
+            scene_lights[1] = .{
+                .kind = .point,
+                .position_or_direction = point_pos,
+                .color = .{ 0.35, 0.75, 1.0 },
+                .intensity = 8.0,
+                .range = 6.0,
+            };
+            scene_lights[2] = .{
+                .kind = .spot,
+                .position_or_direction = .{ -1.8, ground0 + 2.5, -1.5 },
+                .spot_direction = .{ 0.45, -1.0, 0.35 },
+                .color = .{ 1.0, 0.55, 0.20 },
+                .intensity = 18.0,
+                .range = 10.0,
+                .inner_cone = std.math.degreesToRadians(12.0),
+                .outer_cone = std.math.degreesToRadians(28.0),
+            };
+            scene_lights[3] = .{
+                .kind = .point,
+                .position_or_direction = .{ 3.5, ground0 + 1.2, -2.0 },
+                .color = .{ 1.0, 0.3, 0.4 },
+                .intensity = 5.0,
+                .range = 8.0,
+            };
+            scene_lights[4] = .{
+                .kind = .point,
+                .position_or_direction = .{ -3.0, ground0 + 0.8, 2.5 },
+                .color = .{ 0.3, 1.0, 0.5 },
+                .intensity = 4.5,
+                .range = 7.0,
+            };
+            scene_lights[5] = .{
+                .kind = .point,
+                .position_or_direction = .{ 0.0, ground0 + 2.0, 4.0 },
+                .color = .{ 0.9, 0.9, 0.4 },
+                .intensity = 3.5,
+                .range = 9.0,
+            };
+            scene_lights[6] = .{
+                .kind = .spot,
+                .position_or_direction = .{ 2.5, ground0 + 3.0, 2.0 },
+                .spot_direction = .{ -0.3, -1.0, -0.2 },
+                .color = .{ 0.6, 0.8, 1.0 },
+                .intensity = 12.0,
+                .range = 12.0,
+                .inner_cone = std.math.degreesToRadians(10.0),
+                .outer_cone = std.math.degreesToRadians(24.0),
+            };
+            scene_lights[7] = .{
+                .kind = .point,
+                .position_or_direction = .{ -1.5, ground0 + 0.5, -3.5 },
+                .color = .{ 0.8, 0.4, 1.0 },
+                .intensity = 4.0,
+                .range = 6.5,
+            };
+            scene_lights[8] = .{
+                .kind = .point,
+                .position_or_direction = .{ 4.0, ground0 + 0.7, 1.0 },
+                .color = .{ 1.0, 0.7, 0.3 },
+                .intensity = 3.5,
+                .range = 5.5,
+            };
+            scene_lights[9] = .{
+                .kind = .point,
+                .position_or_direction = .{ -4.0, ground0 + 1.5, -1.0 },
+                .color = .{ 0.4, 0.6, 1.0 },
+                .intensity = 3.0,
+                .range = 7.0,
+            };
+            scene_lights[10] = .{
+                .kind = .point,
+                .position_or_direction = .{ 1.5, ground0 + 0.4, -4.5 },
+                .color = .{ 0.9, 0.2, 0.6 },
+                .intensity = 3.2,
+                .range = 5.0,
+            };
+            scene_lights[11] = .{
+                .kind = .spot,
+                .position_or_direction = .{ 0.0, ground0 + 4.0, 0.0 },
+                .spot_direction = .{ 0.1, -1.0, 0.1 },
+                .color = .{ 1.0, 0.95, 0.85 },
+                .intensity = 14.0,
+                .range = 14.0,
+                .inner_cone = std.math.degreesToRadians(8.0),
+                .outer_cone = std.math.degreesToRadians(22.0),
+            };
+            scene_light_count = 12;
+        }
 
         if (!self.sponza_mode) {
             draw_list.buildDemoRenderables(
@@ -1169,12 +1594,29 @@ pub const Renderer = struct {
             .scene_light_count = scene_light_count,
         };
 
+        // Bruneton LUTs + cloud trace/TAA/shadows/rain/panorama.
+        if (self.atm.params.enabled) {
+            self.atm.prepare(gctx, encoder, .{ cam_pos[0], cam_pos[1], cam_pos[2] }, dt);
+            self.refreshLightBindGroup();
+        }
+
         // Full deferred frame
         self.passShadowCsm();
         self.passShadowPoint();
         self.passShadowSpot();
         self.passGBuffer();
+        self.passGtao();
+        self.passHzb();
+        self.passGiVolume();
+        self.passDdgi();
+        self.passSsgi();
         self.passLighting();
+        self.passDdgiApply();
+        self.passSsgiApply();
+        if (self.ddgi_fx.ready) {
+            self.ddgi_fx.captureHdr(gctx, encoder, self.targets.hdr);
+        }
+        self.passRain();
         self.passBloom();
         self.passExposure();
         self.passTonemap();
@@ -1189,6 +1631,10 @@ pub const Renderer = struct {
         if (gctx.present() == .swap_chain_resized) {
             self.targets.resize(gctx);
             self.bloom_targets.resize(gctx);
+            if (self.gtao_fx.ready) self.gtao_fx.resize(gctx);
+            if (self.ddgi_fx.ready) self.ddgi_fx.ensurePrevHdr(gctx);
+            if (self.ssgi_fx.ready) self.ssgi_fx.resize(gctx);
+            if (self.hzb_fx.ready) self.hzb_fx.resize(gctx);
             self.rebuildBindGroups();
             self.onFramebufferResize(gctx.swapchain_descriptor.width, gctx.swapchain_descriptor.height);
         }
@@ -1281,7 +1727,19 @@ pub const Renderer = struct {
             pass.setPipeline(pipeline.?);
             pass.setViewport(0, 0, @floatFromInt(shadow.map_size), @floatFromInt(shadow.map_size), 0, 1);
             pass.setScissorRect(0, 0, shadow.map_size, shadow.map_size);
-            self.drawCastersDepth(pass, bind_group.?, cascades.light_vp[cascade_i]);
+            if (self.sponza_mode) {
+                if (self.sponza) |*scene| {
+                    gltf_scene.drawDepth(
+                        scene,
+                        gctx,
+                        pass,
+                        cascades.light_vp[cascade_i],
+                        self.gpu_draw.shadow_instances,
+                    );
+                }
+            } else {
+                self.drawCastersDepth(pass, bind_group.?, cascades.light_vp[cascade_i]);
+            }
             pass.end();
             pass.release();
         }
@@ -1462,8 +1920,9 @@ pub const Renderer = struct {
             .color_attachments = &color_attachments,
             .depth_stencil_attachment = &depth_attachment,
         });
-        pass.setPipeline(pipeline);
         if (self.sponza_mode) {
+            const pipe_n = gctx.lookupResource(self.gbuffer_pipeline_nocull) orelse pipeline;
+            pass.setPipeline(pipe_n);
             if (self.sponza) |*scene| {
                 gltf_scene.drawGBuffer(
                     scene,
@@ -1474,6 +1933,7 @@ pub const Renderer = struct {
                 );
             }
         } else {
+            pass.setPipeline(pipeline);
             self.drawVisibleGBuffer(pass, bind_group);
             self.terrain.draw(gctx, pass, self.frame.world_to_clip);
         }
@@ -1531,11 +1991,21 @@ pub const Renderer = struct {
             }
         }
         const last_split = self.frame.cascades.splits[3];
+        // Soft sky fill only — diffuse bounce comes from IBL (+ DDGI/SSGI). Avoid milky ambient.
+        const ambient: [3]f32 = if (self.sponza_mode)
+            .{ 0.018, 0.022, 0.032 }
+        else if (self.atm.params.enabled)
+            self.atm.ambient_sky
+        else
+            .{ 0.0, 0.0, 0.0 };
+        const cam_km = @max(self.frame.cam_pos[1] * self.atm.params.world_to_km, 0.001);
+        const atm_enabled: f32 = if (self.atm.params.enabled and !self.sponza_mode) 1.0 else 0.0;
+        const ddgi_pack = self.ddgi_fx.packing();
         mem.slice[0] = lights.packFrame(
             self.frame.inv_view_proj,
             self.frame.view,
             self.frame.cam_pos,
-            .{ 0.0, 0.0, 0.0 },
+            ambient,
             self.frame.scene_lights[0..self.frame.scene_light_count],
             self.env.sh,
             self.env.max_mip,
@@ -1547,6 +2017,23 @@ pub const Renderer = struct {
             .{ self.point_shadow_bias, self.point_shadow_soft, 1.0, 0.2 },
             &spot_vps,
             .{ last_split * 0.75, last_split, 0.1, 0.0 },
+            .{ self.atm.sun_dir[0], self.atm.sun_dir[1], self.atm.sun_dir[2], self.atm.sun_illuminance },
+            .{ self.atm.moon_dir[0], self.atm.moon_dir[1], self.atm.moon_dir[2], self.atm.moon_illuminance },
+            .{
+                cam_km,
+                self.atm.params.fog_density + self.atm.params.rain * 0.4,
+                self.atm.params.cloud_coverage,
+                atm_enabled,
+            },
+            .{
+                if (self.rain_fx.ready) self.rain_fx.controller.intensity else self.atm.params.rain,
+                self.atm.params.snow,
+                self.time,
+                self.atm.moon_phase,
+            },
+            ddgi_pack.origin,
+            ddgi_pack.grid,
+            ddgi_pack.params,
         );
         pass.setBindGroup(0, bind_group, &.{mem.offset});
         pass.draw(3, 1, 0, 0);
@@ -1841,7 +2328,7 @@ pub const Renderer = struct {
             pass.setPipeline(pipeline);
             const adapt_up = 1.0 - std.math.exp(-dt * 1.0);
             const mem = gctx.uniformsAllocate(exposure.AdaptUniforms, 1);
-            mem.slice[0] = .{ .params = .{ 0.18, adapt_up, 0.25, 5.0 } };
+            mem.slice[0] = .{ .params = .{ self.exposure_key, adapt_up, self.exposure_min, self.exposure_max } };
             pass.setBindGroup(0, bind_group, &.{mem.offset});
             pass.draw(3, 1, 0, 0);
         }
@@ -1876,7 +2363,7 @@ pub const Renderer = struct {
         pass.setPipeline(pipeline);
         const mem = gctx.uniformsAllocate(bloom.TonemapUniforms, 1);
         if (mem.slice.len >= 1) {
-            mem.slice[0] = .{ .params = .{ self.bloom_strength, 0, 0, 0 } };
+            mem.slice[0] = .{ .params = .{ self.bloom_strength, self.tonemap_mode, 0, 0 } };
             pass.setBindGroup(0, bind_group, &.{mem.offset});
             pass.draw(3, 1, 0, 0);
         }

@@ -52,6 +52,8 @@ const dxgi_bc1_unorm: u32 = 71;
 const dxgi_bc1_unorm_srgb: u32 = 72;
 const dxgi_bc3_unorm: u32 = 77;
 const dxgi_bc3_unorm_srgb: u32 = 78;
+const dxgi_bc5_unorm: u32 = 83;
+const dxgi_bc5_snorm: u32 = 84;
 const dxgi_bc7_unorm: u32 = 98;
 const dxgi_bc7_unorm_srgb: u32 = 99;
 
@@ -111,6 +113,14 @@ pub fn parse(allocator: std.mem.Allocator, raw: []const u8) !Loaded {
             },
             dxgi_bc3_unorm_srgb => {
                 format = .bc3_rgba_unorm_srgb;
+                block_bytes = 16;
+            },
+            dxgi_bc5_unorm => {
+                format = .bc5_rg_unorm;
+                block_bytes = 16;
+            },
+            dxgi_bc5_snorm => {
+                format = .bc5_rg_snorm;
                 block_bytes = 16;
             },
             dxgi_bc7_unorm => {

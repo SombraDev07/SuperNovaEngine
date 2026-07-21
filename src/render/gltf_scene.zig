@@ -9,6 +9,9 @@ const mesh = @import("mesh.zig");
 const material = @import("material.zig");
 const draw_list = @import("draw_list.zig");
 const frustum_mod = @import("frustum.zig");
+const gpu_driven = @import("gpu_driven.zig");
+const gbuffer = @import("gbuffer.zig");
+const shadow = @import("shadow.zig");
 
 const zcgltf = zmesh.io.zcgltf;
 
@@ -18,17 +21,15 @@ pub const Primitive = struct {
     local_min: [3]f32 = .{ -0.5, -0.5, -0.5 },
     local_max: [3]f32 = .{ 0.5, 0.5, 0.5 },
     material_index: u32 = 0,
-    /// metallic, roughness, ao, use_maps
-    material: [4]f32 = .{ 1, 1, 1, 1 },
-    color: [3]f32 = .{ 1, 1, 1 },
 };
 
 pub const MaterialGpu = struct {
-    maps: material.Maps = .{},
+    mat: material.Material = .{},
     gbuffer_bg: zgpu.BindGroupHandle = .{},
+    shadow_bg: zgpu.BindGroupHandle = .{},
 };
 
-/// Loaded glTF scene ready for deferred G-buffer draws (Sponza test path).
+/// Loaded glTF scene ready for deferred G-buffer + CSM alpha shadows.
 pub const Scene = struct {
     allocator: std.mem.Allocator,
     primitives: std.ArrayList(Primitive) = .{},
@@ -44,7 +45,8 @@ pub const Scene = struct {
         self.primitives.deinit(self.allocator);
         for (self.materials.items) |*m| {
             if (gctx.isResourceValid(m.gbuffer_bg)) gctx.releaseResource(m.gbuffer_bg);
-            m.maps.destroy(gctx);
+            if (gctx.isResourceValid(m.shadow_bg)) gctx.releaseResource(m.shadow_bg);
+            m.mat.destroy(gctx);
         }
         self.materials.deinit(self.allocator);
         self.* = undefined;
@@ -53,26 +55,34 @@ pub const Scene = struct {
     pub fn createBindGroups(
         self: *Scene,
         gctx: *zgpu.GraphicsContext,
-        bgl: zgpu.BindGroupLayoutHandle,
-        instance_buf: zgpu.BufferHandle,
+        gbuffer_bgl: zgpu.BindGroupLayoutHandle,
+        shadow_bgl: zgpu.BindGroupLayoutHandle,
+        gbuffer_instances: zgpu.BufferHandle,
+        shadow_instances: zgpu.BufferHandle,
         instance_bytes: usize,
     ) void {
         for (self.materials.items) |*m| {
             if (gctx.isResourceValid(m.gbuffer_bg)) gctx.releaseResource(m.gbuffer_bg);
-            m.gbuffer_bg = gctx.createBindGroup(bgl, &.{
-                .{ .binding = 0, .buffer_handle = gctx.uniforms.buffer, .offset = 0, .size = @sizeOf(@import("gbuffer.zig").GBufferUniforms) },
-                .{ .binding = 1, .buffer_handle = instance_buf, .offset = 0, .size = instance_bytes },
-                .{ .binding = 2, .sampler_handle = m.maps.sampler },
-                .{ .binding = 3, .texture_view_handle = m.maps.albedo_view },
-                .{ .binding = 4, .texture_view_handle = m.maps.normal_view },
-                .{ .binding = 5, .texture_view_handle = m.maps.orm_view },
-                .{ .binding = 6, .texture_view_handle = m.maps.emissive_view },
+            if (gctx.isResourceValid(m.shadow_bg)) gctx.releaseResource(m.shadow_bg);
+            m.gbuffer_bg = gctx.createBindGroup(gbuffer_bgl, &.{
+                .{ .binding = 0, .buffer_handle = gctx.uniforms.buffer, .offset = 0, .size = @sizeOf(gbuffer.GBufferUniforms) },
+                .{ .binding = 1, .buffer_handle = gbuffer_instances, .offset = 0, .size = instance_bytes },
+                .{ .binding = 2, .sampler_handle = m.mat.maps.sampler },
+                .{ .binding = 3, .texture_view_handle = m.mat.maps.albedo_view },
+                .{ .binding = 4, .texture_view_handle = m.mat.maps.normal_view },
+                .{ .binding = 5, .texture_view_handle = m.mat.maps.orm_view },
+                .{ .binding = 6, .texture_view_handle = m.mat.maps.emissive_view },
+            });
+            m.shadow_bg = gctx.createBindGroup(shadow_bgl, &.{
+                .{ .binding = 0, .buffer_handle = gctx.uniforms.buffer, .offset = 0, .size = @sizeOf(shadow.DepthUniforms) },
+                .{ .binding = 1, .buffer_handle = shadow_instances, .offset = 0, .size = instance_bytes },
+                .{ .binding = 2, .sampler_handle = m.mat.maps.sampler },
+                .{ .binding = 3, .texture_view_handle = m.mat.maps.albedo_view },
             });
         }
     }
 };
 
-/// Load glTF/GLB into GPU meshes + PBR maps (Khronos Sponza / Sample Assets).
 pub fn loadFile(
     gctx: *zgpu.GraphicsContext,
     allocator: std.mem.Allocator,
@@ -89,20 +99,19 @@ pub fn loadFile(
     var scene: Scene = .{ .allocator = allocator };
     errdefer scene.deinit(gctx);
 
-    // Default material (index 0) always present.
     try scene.materials.append(allocator, .{
-        .maps = try makeFallbackMaps(gctx),
+        .mat = try makeFallbackMaterial(gctx, allocator),
     });
 
     if (data.materials) |mats| {
         var mi: usize = 0;
         while (mi < data.materials_count) : (mi += 1) {
-            const maps = loadMaterialMaps(gctx, allocator, dir, &mats[mi]) catch |err| {
-                log.warn(.render, "gltf material {d} maps failed ({s}); fallback", .{ mi, @errorName(err) });
-                try scene.materials.append(allocator, .{ .maps = try makeFallbackMaps(gctx) });
+            const mat = loadGltfMaterial(gctx, allocator, dir, &mats[mi]) catch |err| {
+                log.warn(.render, "gltf material {d} failed ({s}); fallback", .{ mi, @errorName(err) });
+                try scene.materials.append(allocator, .{ .mat = try makeFallbackMaterial(gctx, allocator) });
                 continue;
             };
-            try scene.materials.append(allocator, .{ .maps = maps });
+            try scene.materials.append(allocator, .{ .mat = mat });
         }
     }
 
@@ -119,7 +128,6 @@ pub fn loadFile(
     };
 
     if (roots.len == 0 and data.nodes_count > 0) {
-        // Fallback: every node with no parent.
         var ni: usize = 0;
         while (ni < data.nodes_count) : (ni += 1) {
             const node = &data.nodes.?[ni];
@@ -132,7 +140,6 @@ pub fn loadFile(
         }
     }
 
-    // Scene AABB from world-space primitive bounds.
     if (scene.primitives.items.len > 0) {
         var amin = [3]f32{ std.math.floatMax(f32), std.math.floatMax(f32), std.math.floatMax(f32) };
         var amax = [3]f32{ -std.math.floatMax(f32), -std.math.floatMax(f32), -std.math.floatMax(f32) };
@@ -222,27 +229,12 @@ fn appendNodePrimitives(
             }
 
             const prim = &mesh_ptr.primitives[pi];
-            const mat_idx = materialIndex(data, prim.material);
-            var metal: f32 = 1;
-            var rough: f32 = 1;
-            var color = [3]f32{ 1, 1, 1 };
-            if (prim.material) |m| {
-                if (m.has_pbr_metallic_roughness != 0) {
-                    const pbr = m.pbr_metallic_roughness;
-                    metal = pbr.metallic_factor;
-                    rough = pbr.roughness_factor;
-                    color = .{ pbr.base_color_factor[0], pbr.base_color_factor[1], pbr.base_color_factor[2] };
-                }
-            }
-
             try scene.primitives.append(allocator, .{
                 .gpu = mesh.createGpuMesh(gctx, verts, indices.items),
                 .transform = world,
                 .local_min = amin,
                 .local_max = amax,
-                .material_index = mat_idx,
-                .material = .{ metal, rough, 1.0, 1.0 },
-                .color = color,
+                .material_index = materialIndex(data, prim.material),
             });
         }
     }
@@ -262,7 +254,6 @@ fn indexOfMesh(data: *zcgltf.Data, mesh_ptr: *zcgltf.Mesh) u32 {
 }
 
 fn materialIndex(data: *zcgltf.Data, mat: ?*zcgltf.Material) u32 {
-    // materials[0] in Scene is fallback; glTF materials start at index 1.
     const m = mat orelse return 0;
     const base = data.materials orelse return 0;
     const off = @intFromPtr(m) - @intFromPtr(base);
@@ -278,72 +269,91 @@ fn matFromGltfColMajor(m: [16]f32) zm.Mat {
     };
 }
 
-fn makeFallbackMaps(gctx: *zgpu.GraphicsContext) !material.Maps {
-    const albedo = try material.createSolidRgba(gctx, .{ 180, 180, 180, 255 }, .rgba8_unorm_srgb);
-    const normal = try material.createSolidRgba(gctx, .{ 128, 128, 255, 255 }, .rgba8_unorm);
-    const orm = try material.createSolidRgba(gctx, .{ 255, 200, 0, 255 }, .rgba8_unorm);
-    const emissive = try material.createSolidRgba(gctx, .{ 0, 0, 0, 255 }, .rgba8_unorm_srgb);
+fn makeFallbackMaterial(gctx: *zgpu.GraphicsContext, allocator: std.mem.Allocator) !material.Material {
+    const albedo = try material.createSolidRgba(gctx, allocator, .{ 180, 180, 180, 255 }, .rgba8_unorm_srgb);
+    const normal = try material.createSolidRgba(gctx, allocator, .{ 128, 128, 255, 255 }, .rgba8_unorm);
+    const orm = try material.createSolidRgba(gctx, allocator, .{ 255, 200, 0, 255 }, .rgba8_unorm);
+    const emissive = try material.createSolidRgba(gctx, allocator, .{ 0, 0, 0, 255 }, .rgba8_unorm_srgb);
     return .{
-        .albedo = albedo.tex,
-        .albedo_view = albedo.view,
-        .normal = normal.tex,
-        .normal_view = normal.view,
-        .orm = orm.tex,
-        .orm_view = orm.view,
-        .emissive = emissive.tex,
-        .emissive_view = emissive.view,
-        .sampler = gctx.createSampler(.{
-            .mag_filter = .linear,
-            .min_filter = .linear,
-            .mipmap_filter = .linear,
-            .address_mode_u = .repeat,
-            .address_mode_v = .repeat,
-            .address_mode_w = .repeat,
-        }),
-        .name = "gltf_fallback",
+        .maps = .{
+            .albedo = albedo.tex,
+            .albedo_view = albedo.view,
+            .normal = normal.tex,
+            .normal_view = normal.view,
+            .orm = orm.tex,
+            .orm_view = orm.view,
+            .emissive = emissive.tex,
+            .emissive_view = emissive.view,
+            .sampler = gctx.createSampler(.{
+                .mag_filter = .linear,
+                .min_filter = .linear,
+                .mipmap_filter = .linear,
+                .address_mode_u = .repeat,
+                .address_mode_v = .repeat,
+                .address_mode_w = .repeat,
+            }),
+            .name = "gltf_fallback",
+        },
+        .metallic = 0.0,
+        .roughness = 0.8,
+        .ao = 1.0,
+        .alpha_mode = .@"opaque",
     };
 }
 
-fn loadMaterialMaps(
+fn gltfAlphaMode(mode: zcgltf.AlphaMode) material.AlphaMode {
+    return switch (mode) {
+        .mask => .mask,
+        .blend => .blend,
+        .@"opaque" => .@"opaque",
+    };
+}
+
+fn loadGltfMaterial(
     gctx: *zgpu.GraphicsContext,
     allocator: std.mem.Allocator,
     dir: []const u8,
     mat: *const zcgltf.Material,
-) !material.Maps {
-    var albedo = try material.createSolidRgba(gctx, .{ 200, 200, 200, 255 }, .rgba8_unorm_srgb);
+) !material.Material {
+    var albedo = try material.createSolidRgba(gctx, allocator, .{ 200, 200, 200, 255 }, .rgba8_unorm_srgb);
     errdefer {
         gctx.releaseResource(albedo.view);
         gctx.destroyResource(albedo.tex);
     }
-    var normal = try material.createSolidRgba(gctx, .{ 128, 128, 255, 255 }, .rgba8_unorm);
+    var normal = try material.createSolidRgba(gctx, allocator, .{ 128, 128, 255, 255 }, .rgba8_unorm);
     errdefer {
         gctx.releaseResource(normal.view);
         gctx.destroyResource(normal.tex);
     }
-    var orm = try material.createSolidRgba(gctx, .{ 255, 180, 0, 255 }, .rgba8_unorm);
+    var orm = try material.createSolidRgba(gctx, allocator, .{ 255, 180, 0, 255 }, .rgba8_unorm);
     errdefer {
         gctx.releaseResource(orm.view);
         gctx.destroyResource(orm.tex);
     }
-    var emissive = try material.createSolidRgba(gctx, .{ 0, 0, 0, 255 }, .rgba8_unorm_srgb);
+    var emissive = try material.createSolidRgba(gctx, allocator, .{ 0, 0, 0, 255 }, .rgba8_unorm_srgb);
     errdefer {
         gctx.releaseResource(emissive.view);
         gctx.destroyResource(emissive.tex);
     }
 
+    var base_color = [3]f32{ 1, 1, 1 };
+    var metallic: f32 = 1;
+    var roughness: f32 = 1;
+
     if (mat.has_pbr_metallic_roughness != 0) {
         const pbr = mat.pbr_metallic_roughness;
+        metallic = pbr.metallic_factor;
+        roughness = pbr.roughness_factor;
+        base_color = .{ pbr.base_color_factor[0], pbr.base_color_factor[1], pbr.base_color_factor[2] };
         if (textureImagePath(allocator, dir, pbr.base_color_texture)) |path| {
             defer allocator.free(path);
-            const loaded = material.loadTextureFile(gctx, allocator, path, .rgba8_unorm_srgb) catch null;
-            if (loaded) |L| {
+            if (material.loadTextureFile(gctx, allocator, path, .rgba8_unorm_srgb)) |L| {
                 gctx.releaseResource(albedo.view);
                 gctx.destroyResource(albedo.tex);
                 albedo.tex = L.tex;
                 albedo.view = L.view;
-            }
+            } else |_| {}
         }
-        // Pack ORM: R=AO, G=roughness, B=metallic from glTF MR (+ optional AO).
         if (textureImagePath(allocator, dir, pbr.metallic_roughness_texture)) |mr_path| {
             defer allocator.free(mr_path);
             const ao_path = textureImagePath(allocator, dir, mat.occlusion_texture);
@@ -359,47 +369,56 @@ fn loadMaterialMaps(
 
     if (textureImagePath(allocator, dir, mat.normal_texture)) |path| {
         defer allocator.free(path);
-        const loaded = material.loadTextureFile(gctx, allocator, path, .rgba8_unorm) catch null;
-        if (loaded) |L| {
+        if (material.loadTextureFile(gctx, allocator, path, .rgba8_unorm)) |L| {
             gctx.releaseResource(normal.view);
             gctx.destroyResource(normal.tex);
             normal.tex = L.tex;
             normal.view = L.view;
-        }
+        } else |_| {}
     }
 
     if (textureImagePath(allocator, dir, mat.emissive_texture)) |path| {
         defer allocator.free(path);
-        const loaded = material.loadTextureFile(gctx, allocator, path, .rgba8_unorm_srgb) catch null;
-        if (loaded) |L| {
+        if (material.loadTextureFile(gctx, allocator, path, .rgba8_unorm_srgb)) |L| {
             gctx.releaseResource(emissive.view);
             gctx.destroyResource(emissive.tex);
             emissive.tex = L.tex;
             emissive.view = L.view;
-        }
+        } else |_| {}
     }
 
     return .{
-        .albedo = albedo.tex,
-        .albedo_view = albedo.view,
-        .normal = normal.tex,
-        .normal_view = normal.view,
-        .orm = orm.tex,
-        .orm_view = orm.view,
-        .emissive = emissive.tex,
-        .emissive_view = emissive.view,
-        .sampler = gctx.createSampler(.{
-            .mag_filter = .linear,
-            .min_filter = .linear,
-            .mipmap_filter = .linear,
-            .address_mode_u = .repeat,
-            .address_mode_v = .repeat,
-            .address_mode_w = .repeat,
-        }),
-        .metallic = if (mat.has_pbr_metallic_roughness != 0) mat.pbr_metallic_roughness.metallic_factor else 1,
-        .roughness = if (mat.has_pbr_metallic_roughness != 0) mat.pbr_metallic_roughness.roughness_factor else 1,
+        .maps = .{
+            .albedo = albedo.tex,
+            .albedo_view = albedo.view,
+            .normal = normal.tex,
+            .normal_view = normal.view,
+            .orm = orm.tex,
+            .orm_view = orm.view,
+            .emissive = emissive.tex,
+            .emissive_view = emissive.view,
+            .sampler = gctx.createSampler(.{
+                .mag_filter = .linear,
+                .min_filter = .linear,
+                .mipmap_filter = .linear,
+                .address_mode_u = .repeat,
+                .address_mode_v = .repeat,
+                .address_mode_w = .repeat,
+            }),
+            .metallic = 1,
+            .roughness = 1,
+            .ao = 1,
+            .name = "gltf",
+        },
+        .metallic = metallic,
+        .roughness = roughness,
         .ao = 1,
-        .name = "gltf",
+        .base_color = base_color,
+        .emissive_factor = mat.emissive_factor,
+        .alpha_mode = gltfAlphaMode(mat.alpha_mode),
+        .alpha_cutoff = mat.alpha_cutoff,
+        .double_sided = mat.double_sided != 0,
+        .use_maps = true,
     };
 }
 
@@ -439,20 +458,49 @@ fn packOrmMaps(
 
     var out = try allocator.alloc([4]u8, w * h);
     defer allocator.free(out);
+    // glTF: metallicRoughness uses G=roughness, B=metallic; R MUST be ignored unless
+    // the same image is also the occlusionTexture. Missing AO → 255 (not MR.R, often 0).
     var i: usize = 0;
     while (i < out.len) : (i += 1) {
         const ao: u8 = if (ao_img) |a| blk: {
             const ap = std.mem.bytesAsSlice([4]u8, a.data[0 .. w * h * 4]);
             break :blk ap[i][0];
-        } else mr_px[i][0];
-        // glTF MR: G=roughness, B=metallic → engine ORM G/B.
+        } else 255;
         out[i] = .{ ao, mr_px[i][1], mr_px[i][2], 255 };
     }
-    const tex = material.uploadRgba8Public(gctx, out, w, h, .rgba8_unorm);
+    const tex = try material.uploadRgba8Public(gctx, allocator, out, w, h, .rgba8_unorm);
     return .{ .tex = tex, .view = gctx.createTextureView(tex, .{}) };
 }
 
-/// Draw frustum-visible primitives into an active G-buffer pass (1 instance each).
+fn drawPrimitive(
+    scene: *const Scene,
+    gctx: *zgpu.GraphicsContext,
+    pass: wgpu.RenderPassEncoder,
+    p: Primitive,
+    instance_buf: zgpu.BufferHandle,
+    use_shadow_bg: bool,
+    uniform_offset: u32,
+) void {
+    const mat_i = @min(p.material_index, @as(u32, @intCast(scene.materials.items.len -| 1)));
+    const mg = &scene.materials.items[mat_i];
+    const bg_handle = if (use_shadow_bg) mg.shadow_bg else mg.gbuffer_bg;
+    const bg = gctx.lookupResource(bg_handle) orelse return;
+    const vb = gctx.lookupResourceInfo(p.gpu.vertex_buffer) orelse return;
+    const ib = gctx.lookupResourceInfo(p.gpu.index_buffer) orelse return;
+
+    const inst: gpu_driven.InstanceGpu = .{
+        .object_to_world = zm.transpose(p.transform),
+        .material = mg.mat.instanceMaterial(),
+        .color = mg.mat.instanceColor(),
+    };
+    gctx.queue.writeBuffer(gctx.lookupResource(instance_buf).?, 0, gpu_driven.InstanceGpu, &.{inst});
+
+    pass.setBindGroup(0, bg, &.{uniform_offset});
+    pass.setVertexBuffer(0, vb.gpuobj.?, 0, vb.size);
+    pass.setIndexBuffer(ib.gpuobj.?, .uint32, 0, ib.size);
+    pass.drawIndexed(p.gpu.index_count, 1, 0, 0, 0);
+}
+
 pub fn drawGBuffer(
     scene: *const Scene,
     gctx: *zgpu.GraphicsContext,
@@ -461,36 +509,29 @@ pub fn drawGBuffer(
     instance_buf: zgpu.BufferHandle,
 ) void {
     const fr = frustum_mod.Frustum.fromViewProj(world_to_clip);
-    const gpu_driven = @import("gpu_driven.zig");
-
     for (scene.primitives.items) |p| {
         const world_aabb = draw_list.transformAabb(p.local_min, p.local_max, p.transform);
         if (!fr.containsAabb(world_aabb[0], world_aabb[1])) continue;
-
-        const mat_i = @min(p.material_index, @as(u32, @intCast(scene.materials.items.len -| 1)));
-        const mat = &scene.materials.items[mat_i];
-        const bg = gctx.lookupResource(mat.gbuffer_bg) orelse continue;
-        const vb = gctx.lookupResourceInfo(p.gpu.vertex_buffer) orelse continue;
-        const ib = gctx.lookupResourceInfo(p.gpu.index_buffer) orelse continue;
-
-        var inst: gpu_driven.InstanceGpu = .{
-            .object_to_world = zm.transpose(p.transform),
-            .material = p.material,
-            .color = .{ p.color[0], p.color[1], p.color[2], 1 },
-        };
-        // Align material factors with Maps multipliers when present.
-        inst.material[0] *= mat.maps.metallic;
-        inst.material[1] *= mat.maps.roughness;
-        inst.material[2] *= mat.maps.ao;
-
-        gctx.queue.writeBuffer(gctx.lookupResource(instance_buf).?, 0, gpu_driven.InstanceGpu, &.{inst});
-
-        const mem = gctx.uniformsAllocate(@import("gbuffer.zig").GBufferUniforms, 1);
+        const mem = gctx.uniformsAllocate(gbuffer.GBufferUniforms, 1);
         mem.slice[0] = .{ .world_to_clip = zm.transpose(world_to_clip) };
+        drawPrimitive(scene, gctx, pass, p, instance_buf, false, mem.offset);
+    }
+}
 
-        pass.setBindGroup(0, bg, &.{mem.offset});
-        pass.setVertexBuffer(0, vb.gpuobj.?, 0, vb.size);
-        pass.setIndexBuffer(ib.gpuobj.?, .uint32, 0, ib.size);
-        pass.drawIndexed(p.gpu.index_count, 1, 0, 0, 0);
+/// CSM / directional depth with albedo alpha test.
+pub fn drawDepth(
+    scene: *const Scene,
+    gctx: *zgpu.GraphicsContext,
+    pass: wgpu.RenderPassEncoder,
+    light_vp: zm.Mat,
+    instance_buf: zgpu.BufferHandle,
+) void {
+    const fr = frustum_mod.Frustum.fromViewProj(light_vp);
+    for (scene.primitives.items) |p| {
+        const world_aabb = draw_list.transformAabb(p.local_min, p.local_max, p.transform);
+        if (!fr.containsAabb(world_aabb[0], world_aabb[1])) continue;
+        const mem = gctx.uniformsAllocate(shadow.DepthUniforms, 1);
+        mem.slice[0] = .{ .light_vp = zm.transpose(light_vp) };
+        drawPrimitive(scene, gctx, pass, p, instance_buf, true, mem.offset);
     }
 }

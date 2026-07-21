@@ -27,6 +27,13 @@ struct Frame {
     point_shadow_params: vec4<f32>,
     cascade_z_ranges: vec4<f32>,
     shadow_fade: vec4<f32>,
+    atm_sun: vec4<f32>,
+    atm_moon: vec4<f32>,
+    atm_params: vec4<f32>,
+    atm_weather: vec4<f32>,
+    ddgi_origin: vec4<f32>,
+    ddgi_grid: vec4<f32>,
+    ddgi_params: vec4<f32>,
 }
 
 @group(0) @binding(0) var<uniform> frame: Frame;
@@ -46,6 +53,13 @@ struct Frame {
 @group(0) @binding(14) var<storage, read> tile_masks: array<u32>;
 @group(0) @binding(15) var emissive_tex: texture_2d<f32>;
 @group(0) @binding(16) var spot_shadow_maps: texture_depth_2d_array;
+@group(0) @binding(17) var skyview_tex: texture_2d<f32>;
+@group(0) @binding(18) var transmittance_tex: texture_2d<f32>;
+@group(0) @binding(19) var atm_samp: sampler;
+@group(0) @binding(20) var cloud_taa_tex: texture_2d<f32>;
+@group(0) @binding(21) var cloud_shadow_tex: texture_2d<f32>;
+@group(0) @binding(22) var rain_map_tex: texture_2d<f32>;
+@group(0) @binding(23) var gtao_tex: texture_2d<f32>;
 
 const PI: f32 = 3.14159265;
 const SHADOW_MAP_SIZE: f32 = 1024.0;
@@ -455,13 +469,42 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let normal_oct = textureSample(normal_oct_tex, samp, in.uv);
     let material = textureSample(material_tex, samp, in.uv);
 
-    let albedo = albedo_ao.rgb;
-    let ao = albedo_ao.a;
+    var albedo = albedo_ao.rgb;
+    // Material ORM AO × screen-space GTAO (Jimenez / Dagor GTAORenderer).
+    let gtao = textureSampleLevel(gtao_tex, samp, in.uv, 0.0).r;
+    let ao = saturate(albedo_ao.a * gtao);
     let is_sky = depth >= 0.9999 || material.b < 0.5;
     let n = decodeOct(normal_oct.xy);
-    let roughness = clamp(material.g, 0.04, 1.0);
+    var roughness = clamp(material.g, 0.04, 1.0);
     let metallic = clamp(material.r, 0.0, 1.0);
     let world_pos = reconstructWorldPos(in.uv, depth);
+
+    // Wet floor: damp + localized poças. Avoid ultra-low roughness when looking
+    // straight down (IBL mip0 → fisheye / “portal” warp on tiles).
+    let rain_amt = frame.atm_weather.x;
+    let floor_w = saturate((n.y - 0.62) * 5.0);
+    let v_early = normalize(frame.camera_pos.xyz - world_pos);
+    let ndv_floor = max(dot(n, v_early), 0.0);
+    if (!is_sky && rain_amt > 0.02 && floor_w > 0.05) {
+        let xz = world_pos.xz;
+        let ang = 0.63;
+        let c = cos(ang);
+        let s = sin(ang);
+        let p = vec2<f32>(xz.x * c - xz.y * s, xz.x * s + xz.y * c) + vec2<f32>(3.7, -1.9);
+        let n1 = fract(sin(dot(floor(p * 0.55), vec2<f32>(127.1, 311.7))) * 43758.5453);
+        let n2 = fract(sin(dot(p * 0.21, vec2<f32>(269.5, 183.3))) * 43758.5453);
+        let n3 = fract(sin(dot(p * 0.47 + 19.0, vec2<f32>(71.7, 112.9))) * 43758.5453);
+        let raw = n1 * 0.35 + n2 * 0.4 + n3 * 0.25;
+        let puddle = smoothstep(0.62, 0.8, raw);
+        let damp = rain_amt * floor_w * 0.12;
+        let poça = puddle * rain_amt * floor_w;
+        albedo *= (1.0 - damp * 0.15 - poça * 0.55);
+        roughness = mix(roughness, 0.28, damp);
+        // Looking down (ndv~1): keep roughness ≥0.16 so env map doesn't fisheye.
+        // Glancing: allow wetter gloss.
+        let wet_r = mix(0.10, 0.18, saturate(ndv_floor));
+        roughness = mix(roughness, wet_r, poça);
+    }
 
     let dir_id = i32(frame.shadow_light_ids.x);
     var sun_shadow = directionalShadow(world_pos, n, in.uv);
@@ -470,13 +513,26 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         sun_shadow *= contactShadow(in.uv, depth, world_pos, sun_dir);
     }
 
-    let ndc = vec2<f32>(in.uv.x * 2.0 - 1.0, 1.0 - in.uv.y * 2.0);
-    let forward = normalize(-frame.camera_pos.xyz);
-    let world_up = vec3<f32>(0.0, 1.0, 0.0);
-    let right = normalize(cross(forward, world_up));
-    let up = cross(right, forward);
-    let sky_dir = normalize(forward + right * ndc.x * 1.2 + up * ndc.y * 0.7);
-    let sky = textureSampleLevel(env_cube, env_samp, sky_dir, 0.0).rgb;
+    let atm_on = frame.atm_params.w > 0.5;
+    let view_ray = normalize(world_pos - frame.camera_pos.xyz);
+    // Rebuild view ray for sky pixels from inv VP (more accurate than cube guess).
+    let ndc4 = vec4<f32>(in.uv.x * 2.0 - 1.0, 1.0 - in.uv.y * 2.0, 1.0, 1.0);
+    let world_far = ndc4 * frame.inv_view_proj;
+    let sky_dir = normalize(world_far.xyz / max(world_far.w, 1e-5) - frame.camera_pos.xyz);
+
+    var sky = textureSampleLevel(env_cube, env_samp, sky_dir, 0.0).rgb;
+    if (atm_on) {
+        // Sky-view LUT + cloud TAA composite (cloud tracing pass).
+        let az = atan2(sky_dir.z, sky_dir.x);
+        let u_az = az / (2.0 * PI) + 0.5;
+        let cos_z = clamp(sky_dir.y, -0.15, 1.0);
+        let v_lin = (cos_z + 0.15) / 1.15;
+        let u_v = sqrt(clamp(v_lin, 0.0, 1.0));
+        let sky_uv = vec2<f32>(u_az, u_v);
+        sky = textureSampleLevel(skyview_tex, atm_samp, sky_uv, 0.0).rgb;
+        let clouds = textureSampleLevel(cloud_taa_tex, atm_samp, sky_uv, 0.0);
+        sky = sky * clouds.a + clouds.rgb;
+    }
 
     let v = normalize(frame.camera_pos.xyz - world_pos);
     let n_dot_v = max(dot(n, v), 0.0);
@@ -509,7 +565,10 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let max_mip = frame.ibl_params.x;
     let spec_ao = specularOcclusion(ao, max(n_dot_v, 0.001), roughness);
 
-    let diffuse_ibl = shIrradiance(n) * albedo;
+    // When DDGI apply-pass is warm, gently fade SH so probes own the bounce.
+    let probe_w = frame.ddgi_params.z * frame.ddgi_params.y;
+    let sh_diff = shIrradiance(n) * mix(1.0, 0.55, probe_w);
+    let diffuse_ibl = sh_diff * albedo;
     let r = reflect(-v, n);
     let spec_mip = roughness * max_mip;
     let prefiltered = textureSampleLevel(env_cube, env_samp, r, spec_mip).rgb;
@@ -523,5 +582,76 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let emissive = textureSample(emissive_tex, samp, in.uv).rgb;
     color += emissive;
 
-    return vec4<f32>(select(color, sky, is_sky), 1.0);
+    // Bruneton aerial perspective (Dagor apply_bruneton_fog role).
+    if (atm_on && !is_sky) {
+        let dist = length(world_pos - frame.camera_pos.xyz);
+        let fog = frame.atm_params.y;
+        let cam_km = max(frame.atm_params.x, 0.001);
+        let r = 6360.0 + cam_km;
+        let mu = clamp(view_ray.y, -1.0, 1.0);
+        // Transmittance LUT: approximate optical path to fragment.
+        let h = sqrt(max(6460.0 * 6460.0 - 6360.0 * 6360.0, 0.0));
+        let rho = sqrt(max(r * r - 6360.0 * 6360.0, 0.0));
+        let d_top = max(0.0, -r * mu + sqrt(max(r * r * (mu * mu - 1.0) + 6460.0 * 6460.0, 0.0)));
+        let d_min = 6460.0 - r;
+        let d_max = rho + h;
+        let x_mu = clamp((d_top - d_min) / max(d_max - d_min, 1e-4), 0.0, 1.0);
+        let x_r = clamp(rho / max(h, 1e-4), 0.0, 1.0);
+        let t_uv = vec2<f32>(0.5 / 256.0 + x_mu * (1.0 - 1.0 / 256.0), 0.5 / 64.0 + x_r * (1.0 - 1.0 / 64.0));
+        let t_sun = textureSampleLevel(transmittance_tex, atm_samp, t_uv, 0.0).rgb;
+        // Distance fog coupled to atmosphere + weather (rain/snow boost).
+        let weather_boost = 1.0 + frame.atm_weather.x * 1.5 + frame.atm_weather.y * 1.2;
+        let optical = (0.00008 + fog * 0.00035) * weather_boost * dist;
+        let transmittance = exp(-vec3<f32>(optical)) * mix(vec3<f32>(1.0), t_sun, 0.35);
+        let sun_dir = normalize(frame.atm_sun.xyz);
+        let cos_th = clamp(dot(view_ray, sun_dir), 0.0, 1.0);
+        let phase = 0.75 + 0.5 * cos_th * cos_th;
+        let inscatter = sky * (1.0 - transmittance) * phase * (0.35 + 0.65 * frame.atm_sun.w);
+        // 3D cloud shadow map (4 height bands → mean OD → beer), cam-centered ±40 km.
+        let xz_km = world_pos.xz * 0.001;
+        let cam_km_xz = frame.camera_pos.xz * 0.001;
+        let shadow_uv = (xz_km - cam_km_xz) / 80.0 + 0.5;
+        let od4 = textureSampleLevel(cloud_shadow_tex, atm_samp, clamp(shadow_uv, vec2<f32>(0.0), vec2<f32>(1.0)), 0.0);
+        let od = (od4.x + od4.y + od4.z + od4.w) * 0.25;
+        let cloud_shadow = exp(-od);
+        color = color * transmittance * cloud_shadow + inscatter;
+    }
+
+    var out_color = select(color, sky, is_sky);
+
+    // Rain map GPU + screen streaks.
+    let rain = frame.atm_weather.x;
+    let snow = frame.atm_weather.y;
+    if (atm_on && (rain > 0.02 || snow > 0.02)) {
+        var local_rain = rain;
+        var local_snow = snow;
+        if (!is_sky) {
+            let ruv = (world_pos.xz * 0.001 - frame.camera_pos.xz * 0.001) / 64.0 + 0.5;
+            let rmap = textureSampleLevel(rain_map_tex, atm_samp, clamp(ruv, vec2<f32>(0.0), vec2<f32>(1.0)), 0.0);
+            local_rain = max(rain, rmap.r);
+            local_snow = max(snow, rmap.b);
+            if (rmap.g > 0.05) {
+                out_color *= (1.0 - rmap.g * 0.25);
+                out_color += sky * rmap.g * 0.08;
+            }
+        }
+        let scroll = frame.atm_weather.z * 2.5;
+        let stagger = in.uv * vec2<f32>(90.0, 50.0);
+        let drop = fract(stagger.y * 0.15 + scroll * local_rain + hashRain(vec2<f32>(floor(stagger.x), 0.0)));
+        if (local_rain > 0.02 && drop > 1.0 - local_rain * 0.12 && fract(stagger.x) < 0.08) {
+            out_color += vec3<f32>(0.18, 0.20, 0.24) * local_rain;
+        }
+        let flake = hashRain(floor(in.uv * 140.0 + vec2<f32>(scroll * local_snow, scroll * 0.7)));
+        if (local_snow > 0.02 && flake > 1.0 - local_snow * 0.06) {
+            out_color += vec3<f32>(0.4, 0.42, 0.45) * local_snow;
+        }
+    }
+
+    return vec4<f32>(out_color, 1.0);
+}
+
+fn hashRain(p: vec2<f32>) -> f32 {
+    var p3 = fract(vec3<f32>(p.xyx) * 0.1031);
+    p3 += dot(p3, p3.yzx + 33.33);
+    return fract((p3.x + p3.y) * p3.z);
 }

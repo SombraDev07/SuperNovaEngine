@@ -138,9 +138,9 @@ pub const EventBus = struct {
         self.publish(.{ .id = .mouse_button, .payload = &payload });
     }
 
-    /// Dagor-like: skip draw when unfocused iconified (inactive).
+    /// Skip draw only when iconified. Unfocused windows still render (see Renderer.shouldDraw).
     pub fn shouldDrawApp(self: *const EventBus) bool {
-        return self.focused and !self.iconified;
+        return !self.iconified;
     }
 };
 
@@ -169,9 +169,12 @@ test "focus mouse payloads" {
     var bus = EventBus.init(allocator);
     defer bus.deinit();
     bus.publishFocus(false);
-    try std.testing.expect(!bus.shouldDrawApp());
+    // Unfocused still draws (iconify is what pauses).
+    try std.testing.expect(bus.shouldDrawApp());
     bus.publishFocus(true);
     bus.publishMouseMove(10, 20);
     bus.publishMouseButton(0, 1, 0, 10, 20);
     try std.testing.expect(bus.shouldDrawApp());
+    bus.publishIconify(true);
+    try std.testing.expect(!bus.shouldDrawApp());
 }

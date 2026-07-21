@@ -5,8 +5,8 @@ struct Frame {
 
 struct Instance {
     object_to_world: mat4x4<f32>,
-    material: vec4<f32>,
-    color: vec4<f32>,
+    material: vec4<f32>, // metallic, roughness, ao, use_maps
+    color: vec4<f32>,    // rgb factor; a = alpha cutoff (0 = opaque)
 }
 
 @group(0) @binding(0) var<uniform> frame: Frame;
@@ -26,6 +26,7 @@ struct VsOut {
     @location(4) uv: vec2<f32>,
     @location(5) material: vec4<f32>,
     @location(6) view_dir_ts: vec3<f32>,
+    @location(7) alpha_cutoff: f32,
 }
 
 struct GBuffer {
@@ -46,7 +47,6 @@ fn encodeOct(n_in: vec3<f32>) -> vec2<f32> {
 }
 
 fn parallaxUv(uv: vec2<f32>, view_ts: vec3<f32>) -> vec2<f32> {
-    // Height in ORM.a; cheap offset parallax (Dagor-style authoring slot).
     let height = textureSample(orm_map, mat_samp, uv).a;
     let scale = 0.04;
     let v = normalize(view_ts);
@@ -71,9 +71,9 @@ fn vs_main(
     out.albedo = color * inst.color.xyz;
     out.uv = uv;
     out.material = inst.material;
+    out.alpha_cutoff = inst.color.w;
     let world = vec4<f32>(position, 1.0) * inst.object_to_world;
     out.position_clip = world * frame.world_to_clip;
-    // Approximate view dir in tangent space (camera at origin of clip — use -world for demo).
     let view_ws = normalize(-world.xyz);
     out.view_dir_ts = vec3<f32>(
         dot(view_ws, out.world_t),
@@ -92,17 +92,22 @@ fn fs_main(in: VsOut) -> GBuffer {
     var ao = in.material.z;
     var emissive = vec3<f32>(0.0);
 
-    // Always sample (uniform control flow) — blend with vertex material via flag.
     let use_maps = in.material.w > 0.5;
     let uv_para = parallaxUv(in.uv, in.view_dir_ts);
     let uv = select(in.uv, uv_para, use_maps);
-    let base = textureSample(albedo_map, mat_samp, uv).rgb;
+    let base_s = textureSample(albedo_map, mat_samp, uv);
     let orm = textureSample(orm_map, mat_samp, uv);
     let nt = textureSample(normal_map, mat_samp, uv).xyz * 2.0 - 1.0;
     let em = textureSample(emissive_map, mat_samp, uv).rgb;
     let n_mapped = normalize(in.world_t * nt.x + in.world_b * nt.y + in.world_n * nt.z);
 
-    albedo = select(albedo, base * in.albedo, use_maps);
+    // Alpha mask / blend cutout (glTF MASK/BLEND → discard). color.w == 0 → opaque.
+    let alpha = select(1.0, base_s.a, use_maps);
+    if (in.alpha_cutoff > 0.0 && alpha < in.alpha_cutoff) {
+        discard;
+    }
+
+    albedo = select(albedo, base_s.rgb * in.albedo, use_maps);
     ao = select(ao, ao * orm.r, use_maps);
     roughness = select(roughness, roughness * orm.g, use_maps);
     metallic = select(metallic, metallic * orm.b, use_maps);

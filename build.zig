@@ -10,7 +10,7 @@ pub fn build(b: *std.Build) void {
     const zglfw = b.dependency("zglfw", .{ .target = target });
     const zgpu = b.dependency("zgpu", .{
         .target = target,
-        .max_num_bindings_per_group = 24,
+                .max_num_bindings_per_group = 32,
     });
     const zpool = b.dependency("zpool", .{});
     const zmath = b.dependency("zmath", .{ .target = target });

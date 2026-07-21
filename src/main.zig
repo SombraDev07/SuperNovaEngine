@@ -516,6 +516,7 @@ const App = struct {
         zglfw.pollEvents();
 
         if (self.renderer.isDeviceLost()) {
+            logQuitReason("device_lost");
             self.wants_quit = true;
             return;
         }
@@ -523,11 +524,8 @@ const App = struct {
         const grave = self.window.getKey(.grave_accent) == .press;
         const f1 = self.window.getKey(.F1) == .press;
         const esc = self.window.getKey(.escape) == .press;
-        const was_open = self.console.open;
+        // ESC closes console only — does not quit the app (use window X or console `quit`).
         _ = self.console.handleInput(grave, f1, esc);
-        if (esc and !self.esc_was_down and !was_open) {
-            self.wants_quit = true;
-        }
         self.esc_was_down = esc;
 
         self.updateSculptHotkeys();
@@ -565,6 +563,137 @@ const App = struct {
         const gctx = self.renderer.gctx;
         zgui.backend.newFrame(gctx.swapchain_descriptor.width, gctx.swapchain_descriptor.height);
         self.console.draw();
+        if (!self.sponza_mode and self.renderer.atm.params.enabled) {
+            if (zgui.begin("Sky / Atmosphere", .{})) {
+                _ = zgui.sliderFloat("Time of day", .{
+                    .v = &self.renderer.atm.params.time_of_day,
+                    .min = 0,
+                    .max = 24,
+                });
+                _ = zgui.sliderFloat("Cumulus", .{
+                    .v = &self.renderer.atm.params.cloud_coverage,
+                    .min = 0,
+                    .max = 1,
+                });
+                _ = zgui.sliderFloat("Strata", .{
+                    .v = &self.renderer.atm.params.strata_coverage,
+                    .min = 0,
+                    .max = 1,
+                });
+                _ = zgui.sliderFloat("Wind speed", .{
+                    .v = &self.renderer.atm.params.wind_speed,
+                    .min = 0,
+                    .max = 3,
+                });
+                _ = zgui.sliderFloat("Fog", .{
+                    .v = &self.renderer.atm.params.fog_density,
+                    .min = 0,
+                    .max = 1,
+                });
+                _ = zgui.sliderFloat("Snow", .{
+                    .v = &self.renderer.atm.params.snow,
+                    .min = 0,
+                    .max = 1,
+                });
+                _ = zgui.checkbox("Panorama IBL bake", .{ .v = &self.renderer.atm.params.panorama_enabled });
+                const q = self.renderer.atm.queryAt(
+                    .{ self.renderer.camera.position[0], self.renderer.camera.position[1], self.renderer.camera.position[2] },
+                    self.renderer.atm.sun_dir,
+                );
+                zgui.text("Sun elev {d:.2}  Moon {d:.2}", .{
+                    self.renderer.atm.sun_dir[1],
+                    self.renderer.atm.moon_dir[1],
+                });
+                zgui.text("CPU Tsun {d:.2}  rain {d:.2}  cShadow {d:.2}", .{
+                    q.transmittance_sun[1],
+                    q.rain,
+                    q.cloud_shadow,
+                });
+            }
+            zgui.end();
+            self.renderer.atm.updateAstronomy();
+        }
+        if (self.renderer.rain_fx.ready) {
+            var rc = &self.renderer.rain_fx.controller;
+            if (zgui.begin("Rain Controller", .{})) {
+                _ = zgui.checkbox("Enabled", .{ .v = &rc.enabled });
+                _ = zgui.sliderFloat("Intensity", .{ .v = &rc.target, .min = 0, .max = 1 });
+                _ = zgui.sliderFloat("Transition", .{ .v = &rc.transition_speed, .min = 0.1, .max = 4 });
+                _ = zgui.sliderFloat("Drops amount", .{ .v = &rc.drops_amount, .min = 0, .max = 1.5 });
+                _ = zgui.sliderFloat("Drops speed", .{ .v = &rc.drops_speed, .min = 0.2, .max = 3 });
+                _ = zgui.sliderFloat("Drops size", .{ .v = &rc.drops_size, .min = 0.3, .max = 2.5 });
+                _ = zgui.sliderFloat("Spatter", .{ .v = &rc.spatter_amount, .min = 0, .max = 1.5 });
+                _ = zgui.sliderFloat("Wetness", .{ .v = &rc.wetness, .min = 0, .max = 1.5 });
+                _ = zgui.sliderFloat("Puddles", .{ .v = &rc.puddle_scale, .min = 0.2, .max = 3 });
+                _ = zgui.sliderFloat("Wind influence", .{ .v = &rc.wind_influence, .min = 0, .max = 2 });
+                _ = zgui.checkbox("Sync atmosphere rain", .{ .v = &rc.sync_atmosphere });
+                if (zgui.button("Start medium", .{})) rc.start(0.55);
+                zgui.sameLine(.{});
+                if (zgui.button("Start heavy", .{})) rc.start(0.95);
+                zgui.sameLine(.{});
+                if (zgui.button("Stop", .{})) rc.stop();
+                if (zgui.button("Thunder", .{})) rc.thunder(1.0);
+                zgui.text("Live intensity {d:.2}  (CryEngine textures)", .{rc.intensity});
+            }
+            zgui.end();
+        }
+        if (self.renderer.gtao_fx.ready) {
+            var gp = &self.renderer.gtao_fx.params;
+            if (zgui.begin("GTAO", .{})) {
+                _ = zgui.checkbox("Enabled", .{ .v = &gp.enabled });
+                _ = zgui.sliderFloat("Radius", .{ .v = &gp.radius, .min = 0.1, .max = 2.5 });
+                _ = zgui.sliderFloat("Power", .{ .v = &gp.power, .min = 0.5, .max = 3.0 });
+                _ = zgui.sliderFloat("Thickness", .{ .v = &gp.thickness, .min = 0.1, .max = 2.0 });
+                _ = zgui.sliderFloat("Strength", .{ .v = &gp.strength, .min = 0.0, .max = 1.5 });
+                _ = zgui.sliderFloat("Temporal", .{ .v = &gp.temporal_blend, .min = 0.5, .max = 0.98 });
+                _ = zgui.sliderFloat("Depth sigma", .{ .v = &gp.depth_sigma, .min = 0.2, .max = 3.0 });
+                zgui.text("Jimenez GTAO  {d} slices x {d} steps", .{ gp.slice_count, gp.step_count });
+            }
+            zgui.end();
+        }
+        if (self.renderer.ddgi_fx.ready) {
+            var dp = &self.renderer.ddgi_fx.params;
+            if (zgui.begin("GI / DDGI", .{})) {
+                _ = zgui.checkbox("Enabled", .{ .v = &dp.enabled });
+                _ = zgui.sliderFloat("Intensity", .{ .v = &dp.intensity, .min = 0, .max = 3 });
+                _ = zgui.sliderFloat("Spacing", .{ .v = &dp.spacing, .min = 0.8, .max = 4 });
+                _ = zgui.sliderFloat("Probe blend", .{ .v = &dp.probe_blend, .min = 0, .max = 1 });
+                _ = zgui.sliderFloat("Temporal", .{ .v = &dp.temporal_blend, .min = 0.5, .max = 0.98 });
+                _ = zgui.sliderFloat("Ray length", .{ .v = &dp.max_dist_scale, .min = 0.5, .max = 3 });
+                _ = zgui.sliderFloat("Probes/frame", .{ .v = &dp.probes_per_frame, .min = 16, .max = 128 });
+                _ = zgui.sliderFloat("Max steps", .{ .v = &dp.max_steps, .min = 8, .max = 24 });
+                const o = self.renderer.ddgi_fx.origin;
+                zgui.text("Volume 8x6x8x3 + SDF/lit world trace + SH1", .{});
+                zgui.text("origin0 ({d:.1},{d:.1},{d:.1})", .{ o[0], o[1], o[2] });
+            }
+            zgui.end();
+        }
+        if (self.renderer.gi_vol.ready) {
+            var vp = &self.renderer.gi_vol.params;
+            if (zgui.begin("WorldSDF / Lit Voxels", .{})) {
+                _ = zgui.checkbox("Enabled", .{ .v = &vp.enabled });
+                _ = zgui.sliderFloat("Voxel0", .{ .v = &vp.voxel0, .min = 0.15, .max = 0.8 });
+                _ = zgui.sliderFloat("SDF budget", .{ .v = &vp.mark_budget, .min = 1, .max = 8 });
+                _ = zgui.sliderFloat("Lit budget", .{ .v = &vp.lit_budget, .min = 1, .max = 6 });
+                _ = zgui.sliderFloat("Albedo budget", .{ .v = &vp.albedo_budget, .min = 1, .max = 6 });
+                _ = zgui.checkbox("JFA dilate", .{ .v = &vp.jfa_enabled });
+                zgui.text("64x32x64 x4  JFA+remove+albedo", .{});
+            }
+            zgui.end();
+        }
+        if (self.renderer.ssgi_fx.ready) {
+            var sp = &self.renderer.ssgi_fx.params;
+            if (zgui.begin("SSGI / Screen Probes", .{})) {
+                _ = zgui.checkbox("Enabled", .{ .v = &sp.enabled });
+                _ = zgui.sliderFloat("Intensity", .{ .v = &sp.intensity, .min = 0, .max = 2 });
+                _ = zgui.sliderFloat("Blend", .{ .v = &sp.blend, .min = 0, .max = 1 });
+                _ = zgui.sliderFloat("Temporal", .{ .v = &sp.temporal, .min = 0.5, .max = 0.97 });
+                _ = zgui.sliderFloat("Ray length", .{ .v = &sp.max_ray_m, .min = 1, .max = 12 });
+                _ = zgui.sliderFloat("Rays", .{ .v = &sp.rays, .min = 4, .max = 16 });
+                zgui.text("HZB + spatial filter tile16", .{});
+            }
+            zgui.end();
+        }
         self.renderer.drawFrame(@floatCast(dt), true);
     }
 };
@@ -586,7 +715,17 @@ fn glfwKey(window: *zglfw.Window, key: zglfw.Key, scancode: c_int, action: zglfw
 
 fn glfwClose(window: *zglfw.Window) callconv(.c) void {
     const app = window.getUserPointer(App) orelse return;
+    logQuitReason("window_close");
     app.events.publish(.{ .id = .window_close });
+}
+
+fn logQuitReason(reason: []const u8) void {
+    engine.log.warn(.core, "quit: {s}", .{reason});
+    if (std.fs.cwd().createFile("quit_reason.log", .{})) |f| {
+        defer f.close();
+        f.writeAll(reason) catch {};
+        f.writeAll("\n") catch {};
+    } else |_| {}
 }
 
 fn glfwIconify(window: *zglfw.Window, iconified: zglfw.Bool) callconv(.c) void {

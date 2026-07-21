@@ -19,6 +19,13 @@ pub const astc = @import("astc.zig");
 pub const shader_hot = @import("shader_hot.zig");
 pub const terrain_splat = @import("terrain_splat.zig");
 pub const gltf_scene = @import("gltf_scene.zig");
+pub const atmosphere = @import("atmosphere.zig");
+pub const rain = @import("rain.zig");
+pub const gtao = @import("gtao.zig");
+pub const ddgi = @import("ddgi.zig");
+pub const ssgi = @import("ssgi.zig");
+pub const gi_volume = @import("gi_volume.zig");
+pub const hzb_gpu = @import("hzb_gpu.zig");
 pub const base_pass = @import("base_pass.zig");
 pub const video = @import("video.zig");
 pub const VideoSettings = video.VideoSettings;
@@ -48,4 +55,11 @@ test {
     _ = @import("shader_hot.zig");
     _ = @import("terrain_splat.zig");
     _ = @import("gltf_scene.zig");
+    _ = @import("atmosphere.zig");
+    _ = @import("rain.zig");
+    _ = @import("gtao.zig");
+    _ = @import("ddgi.zig");
+    _ = @import("ssgi.zig");
+    _ = @import("gi_volume.zig");
+    _ = @import("hzb_gpu.zig");
 }

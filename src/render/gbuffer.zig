@@ -63,7 +63,7 @@ pub const Targets = struct {
             .sample_count = 1,
         });
         const hdr = gctx.createTexture(.{
-            .usage = .{ .render_attachment = true, .texture_binding = true },
+            .usage = .{ .render_attachment = true, .texture_binding = true, .copy_src = true },
             .dimension = .tdim_2d,
             .size = .{ .width = w, .height = h, .depth_or_array_layers = 1 },
             .format = .rgba16_float,

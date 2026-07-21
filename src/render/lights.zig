@@ -65,6 +65,20 @@ pub const FrameUniforms = extern struct {
     cascade_z_ranges: [4]f32,
     /// x = last-cascade fade start (view z), y = fade end, z = cascade dither scale, w = unused
     shadow_fade: [4]f32,
+    /// Atmosphere: sun dir xyz + illuminance w
+    atm_sun: [4]f32,
+    /// Moon dir xyz + illuminance w
+    atm_moon: [4]f32,
+    /// x=cam altitude km, y=fog density, z=cloud coverage, w=enabled (0/1)
+    atm_params: [4]f32,
+    /// x=rain, y=snow, z=star intensity, w=moon phase
+    atm_weather: [4]f32,
+    /// DDGI: xyz = probe volume origin, w = intensity
+    ddgi_origin: [4]f32 = .{ 0, 0, 0, 0 },
+    /// x=spacing, y=grid_x, z=grid_y, w=grid_z
+    ddgi_grid: [4]f32 = .{ 2, 8, 6, 8 },
+    /// x=octa_res, y=enabled, z=probe_blend vs SH, w=unused
+    ddgi_params: [4]f32 = .{ 8, 0, 0.85, 0 },
 };
 
 /// One u32 bitmask per froxel (bit i → light i).
@@ -301,6 +315,13 @@ pub fn packFrame(
     point_shadow_params: [4]f32,
     spot_vps: *const [shadow.max_spot_shadow_slots]zm.Mat,
     shadow_fade: [4]f32,
+    atm_sun: [4]f32,
+    atm_moon: [4]f32,
+    atm_params: [4]f32,
+    atm_weather: [4]f32,
+    ddgi_origin: [4]f32,
+    ddgi_grid: [4]f32,
+    ddgi_params: [4]f32,
 ) FrameUniforms {
     const ids = findShadowLights(light_list);
     var out: FrameUniforms = .{
@@ -344,6 +365,13 @@ pub fn packFrame(
         .point_shadow_params = point_shadow_params,
         .cascade_z_ranges = cascades.z_ranges,
         .shadow_fade = shadow_fade,
+        .atm_sun = atm_sun,
+        .atm_moon = atm_moon,
+        .atm_params = atm_params,
+        .atm_weather = atm_weather,
+        .ddgi_origin = ddgi_origin,
+        .ddgi_grid = ddgi_grid,
+        .ddgi_params = ddgi_params,
     };
     @memset(std.mem.asBytes(&out.lights), 0);
 

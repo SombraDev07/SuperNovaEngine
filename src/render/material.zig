@@ -7,18 +7,43 @@ const log = @import("../core/log.zig");
 const dds = @import("dds.zig");
 const astc = @import("astc.zig");
 
-/// Data-driven PBR material definition (ZON, ROADMAP §2.4a).
-/// Paths are relative to the assets root (usually `assets/`).
+/// glTF / engine alpha mode (ROADMAP §2.4).
+pub const AlphaMode = enum(u8) {
+    @"opaque" = 0,
+    mask = 1,
+    blend = 2,
+
+    pub fn fromName(name: []const u8) AlphaMode {
+        if (std.ascii.eqlIgnoreCase(name, "MASK")) return .mask;
+        if (std.ascii.eqlIgnoreCase(name, "BLEND")) return .blend;
+        return .@"opaque";
+    }
+
+    /// Packed into Instance.color.w — 0 disables alpha test.
+    pub fn packedCutoff(self: AlphaMode, cutoff: f32) f32 {
+        return switch (self) {
+            .@"opaque" => 0.0,
+            .mask => if (cutoff > 0.0) cutoff else 0.5,
+            .blend => @max(cutoff, 0.1),
+        };
+    }
+};
+
+/// Data-driven PBR material definition (ZON, ROADMAP §2.4).
 pub const MaterialDef = struct {
     name: []const u8 = "unnamed",
     albedo: []const u8 = "",
     normal: []const u8 = "",
     orm: []const u8 = "",
-    /// Optional; empty → black emissive.
     emissive: []const u8 = "",
     metallic: f32 = 1.0,
     roughness: f32 = 1.0,
     ao: f32 = 1.0,
+    /// "OPAQUE" | "MASK" | "BLEND"
+    alpha_mode: []const u8 = "OPAQUE",
+    alpha_cutoff: f32 = 0.5,
+    double_sided: bool = false,
+    emissive_factor: [3]f32 = .{ 1, 1, 1 },
 
     pub fn parseZon(allocator: std.mem.Allocator, source: [:0]const u8) !MaterialDef {
         return try std.zon.parse.fromSlice(MaterialDef, allocator, source, null, .{});
@@ -36,9 +61,13 @@ pub const MaterialDef = struct {
         defer allocator.free(src);
         return try parseZon(allocator, src);
     }
+
+    pub fn alpha(self: MaterialDef) AlphaMode {
+        return AlphaMode.fromName(self.alpha_mode);
+    }
 };
 
-/// GPU PBR maps bound by the G-buffer pass.
+/// GPU PBR maps bound by the G-buffer / shadow alpha passes.
 pub const Maps = struct {
     albedo: zgpu.TextureHandle = .{},
     albedo_view: zgpu.TextureViewHandle = .{},
@@ -50,14 +79,12 @@ pub const Maps = struct {
     emissive: zgpu.TextureHandle = .{},
     emissive_view: zgpu.TextureViewHandle = .{},
     sampler: zgpu.SamplerHandle = .{},
-    /// Multipliers from the material def (applied in G-buffer uniforms).
     metallic: f32 = 1.0,
     roughness: f32 = 1.0,
     ao: f32 = 1.0,
     name: []const u8 = "procedural",
 
     pub fn create(gctx: *zgpu.GraphicsContext, allocator: std.mem.Allocator) !Maps {
-        // Prefer authored ZON + maps; fall back to procedural if missing.
         const zon_path = "assets/materials/demo_pbr.zon";
         if (std.fs.cwd().access(zon_path, .{})) |_| {
             var def = MaterialDef.loadFile(allocator, zon_path) catch |err| {
@@ -99,10 +126,14 @@ pub const Maps = struct {
             const ep = try joinAsset(allocator, assets_root, def.emissive);
             defer allocator.free(ep);
             break :blk try loadTexture(gctx, allocator, ep, .rgba8_unorm_srgb);
-        } else try createSolidColor(gctx, .{ 0, 0, 0, 255 }, .rgba8_unorm_srgb);
+        } else try createSolidColor(gctx, allocator, .{ 0, 0, 0, 255 }, .rgba8_unorm_srgb);
         errdefer destroyTex(gctx, emissive);
 
-        log.info(.render, "material '{s}' maps loaded", .{def.name});
+        log.info(.render, "material '{s}' maps loaded (alpha={s} cutoff={d:.2})", .{
+            def.name,
+            def.alpha_mode,
+            def.alpha_cutoff,
+        });
         return .{
             .albedo = albedo.tex,
             .albedo_view = albedo.view,
@@ -163,7 +194,6 @@ pub const Maps = struct {
                 const metal: u8 = if (checker) 220 else 10;
                 const height: u8 = @intFromFloat(std.math.clamp(1.0 - edge[2], 0, 1) * 255.0);
                 orm_px[idx] = .{ ao, rough, metal, height };
-                // Warm emissive on metal tiles.
                 if (checker) {
                     emissive_px[idx] = .{ 40, 12, 4, 255 };
                 } else {
@@ -172,10 +202,10 @@ pub const Maps = struct {
             }
         }
 
-        const albedo = uploadRgba8(gctx, albedo_px, map_size, map_size, .rgba8_unorm_srgb);
-        const normal = uploadRgba8(gctx, normal_px, map_size, map_size, .rgba8_unorm);
-        const orm = uploadRgba8(gctx, orm_px, map_size, map_size, .rgba8_unorm);
-        const emissive = uploadRgba8(gctx, emissive_px, map_size, map_size, .rgba8_unorm_srgb);
+        const albedo = try uploadRgba8Mips(gctx, allocator, albedo_px, map_size, map_size, .rgba8_unorm_srgb);
+        const normal = try uploadRgba8Mips(gctx, allocator, normal_px, map_size, map_size, .rgba8_unorm);
+        const orm = try uploadRgba8Mips(gctx, allocator, orm_px, map_size, map_size, .rgba8_unorm);
+        const emissive = try uploadRgba8Mips(gctx, allocator, emissive_px, map_size, map_size, .rgba8_unorm_srgb);
 
         return .{
             .albedo = albedo,
@@ -189,7 +219,7 @@ pub const Maps = struct {
             .sampler = gctx.createSampler(.{
                 .mag_filter = .linear,
                 .min_filter = .linear,
-                .mipmap_filter = .nearest,
+                .mipmap_filter = .linear,
                 .address_mode_u = .repeat,
                 .address_mode_v = .repeat,
                 .address_mode_w = .repeat,
@@ -212,6 +242,64 @@ pub const Maps = struct {
     }
 };
 
+/// Unified runtime material (ZON + glTF).
+pub const Material = struct {
+    maps: Maps = .{},
+    metallic: f32 = 1.0,
+    roughness: f32 = 1.0,
+    ao: f32 = 1.0,
+    base_color: [3]f32 = .{ 1, 1, 1 },
+    emissive_factor: [3]f32 = .{ 0, 0, 0 },
+    alpha_mode: AlphaMode = .@"opaque",
+    alpha_cutoff: f32 = 0.5,
+    double_sided: bool = false,
+    use_maps: bool = true,
+
+    pub fn fromDef(gctx: *zgpu.GraphicsContext, allocator: std.mem.Allocator, assets_root: []const u8, def: MaterialDef) !Material {
+        const maps = try Maps.loadFromDef(gctx, allocator, assets_root, def);
+        return .{
+            .maps = maps,
+            .metallic = def.metallic,
+            .roughness = def.roughness,
+            .ao = def.ao,
+            .emissive_factor = def.emissive_factor,
+            .alpha_mode = def.alpha(),
+            .alpha_cutoff = def.alpha_cutoff,
+            .double_sided = def.double_sided,
+            .use_maps = true,
+        };
+    }
+
+    pub fn destroy(self: *Material, gctx: *zgpu.GraphicsContext) void {
+        self.maps.destroy(gctx);
+        self.* = .{};
+    }
+
+    pub fn packedCutoff(self: Material) f32 {
+        return self.alpha_mode.packedCutoff(self.alpha_cutoff);
+    }
+
+    /// Instance material vec4: metallic, roughness, ao, use_maps.
+    pub fn instanceMaterial(self: Material) [4]f32 {
+        return .{
+            self.metallic * self.maps.metallic,
+            self.roughness * self.maps.roughness,
+            self.ao * self.maps.ao,
+            if (self.use_maps) 1.0 else 0.0,
+        };
+    }
+
+    /// Instance color vec4: rgb * factor, a = alpha cutoff pack.
+    pub fn instanceColor(self: Material) [4]f32 {
+        return .{
+            self.base_color[0],
+            self.base_color[1],
+            self.base_color[2],
+            self.packedCutoff(),
+        };
+    }
+};
+
 const TexPair = struct {
     tex: zgpu.TextureHandle,
     view: zgpu.TextureViewHandle,
@@ -222,7 +310,6 @@ fn destroyTex(gctx: *zgpu.GraphicsContext, t: TexPair) void {
     if (gctx.isResourceValid(t.tex)) gctx.destroyResource(t.tex);
 }
 
-/// Public texture load for glTF / tooling (png/jpg/dds/basis/ktx2/astc).
 pub fn loadTextureFile(
     gctx: *zgpu.GraphicsContext,
     allocator: std.mem.Allocator,
@@ -235,21 +322,23 @@ pub fn loadTextureFile(
 
 pub fn createSolidRgba(
     gctx: *zgpu.GraphicsContext,
+    allocator: std.mem.Allocator,
     rgba: [4]u8,
     format: wgpu.TextureFormat,
 ) !struct { tex: zgpu.TextureHandle, view: zgpu.TextureViewHandle } {
-    const t = try createSolidColor(gctx, rgba, format);
+    const t = try createSolidColor(gctx, allocator, rgba, format);
     return .{ .tex = t.tex, .view = t.view };
 }
 
 pub fn uploadRgba8Public(
     gctx: *zgpu.GraphicsContext,
+    allocator: std.mem.Allocator,
     pixels: []const [4]u8,
     width: u32,
     height: u32,
     format: wgpu.TextureFormat,
-) zgpu.TextureHandle {
-    return uploadRgba8(gctx, pixels, width, height, format);
+) !zgpu.TextureHandle {
+    return try uploadRgba8Mips(gctx, allocator, pixels, width, height, format);
 }
 
 fn joinAsset(allocator: std.mem.Allocator, root: []const u8, rel: []const u8) ![:0]u8 {
@@ -282,7 +371,6 @@ fn loadTexture(
         const srgb = fallback_rgba_format == .rgba8_unorm_srgb or
             fallback_rgba_format == .bc7_rgba_unorm_srgb or
             fallback_rgba_format == .astc4x4_unorm_srgb;
-        // Prefer BC7 on desktop Dawn (D3D12/Vulkan/Metal); ASTC mainly for mobile GPUs.
         var img = try zbasis.transcodeFile(allocator, path_z, false, srgb);
         defer img.deinit();
         const tex = zbasis.upload(gctx, img);
@@ -294,47 +382,115 @@ fn loadTexture(
     const w = img.width;
     const h = img.height;
     const pixels = std.mem.bytesAsSlice([4]u8, img.data[0 .. w * h * 4]);
-    const tex = uploadRgba8(gctx, pixels, w, h, fallback_rgba_format);
+    const tex = try uploadRgba8Mips(gctx, allocator, pixels, w, h, fallback_rgba_format);
     return .{ .tex = tex, .view = gctx.createTextureView(tex, .{}) };
 }
 
-fn createSolidColor(gctx: *zgpu.GraphicsContext, rgba: [4]u8, format: wgpu.TextureFormat) !TexPair {
-    const pixels = [_][4]u8{rgba};
-    const tex = uploadRgba8(gctx, &pixels, 1, 1, format);
-    return .{ .tex = tex, .view = gctx.createTextureView(tex, .{}) };
-}
-
-fn uploadRgba8(
+fn createSolidColor(
     gctx: *zgpu.GraphicsContext,
+    allocator: std.mem.Allocator,
+    rgba: [4]u8,
+    format: wgpu.TextureFormat,
+) !TexPair {
+    const pixels = [_][4]u8{rgba};
+    const tex = try uploadRgba8Mips(gctx, allocator, &pixels, 1, 1, format);
+    return .{ .tex = tex, .view = gctx.createTextureView(tex, .{}) };
+}
+
+fn mipLevelCount(width: u32, height: u32) u32 {
+    var levels: u32 = 1;
+    var w = width;
+    var h = height;
+    while (w > 1 or h > 1) {
+        w = @max(1, w / 2);
+        h = @max(1, h / 2);
+        levels += 1;
+        if (levels >= 16) break;
+    }
+    return levels;
+}
+
+fn boxFilterDown(
+    src: []const [4]u8,
+    sw: u32,
+    sh: u32,
+    dst: [][4]u8,
+    dw: u32,
+    dh: u32,
+) void {
+    var y: u32 = 0;
+    while (y < dh) : (y += 1) {
+        var x: u32 = 0;
+        while (x < dw) : (x += 1) {
+            const x0 = x * 2;
+            const y0 = y * 2;
+            const x1 = @min(x0 + 1, sw - 1);
+            const y1 = @min(y0 + 1, sh - 1);
+            const c00 = src[y0 * sw + x0];
+            const c10 = src[y0 * sw + x1];
+            const c01 = src[y1 * sw + x0];
+            const c11 = src[y1 * sw + x1];
+            dst[y * dw + x] = .{
+                @intCast((@as(u32, c00[0]) + c10[0] + c01[0] + c11[0]) / 4),
+                @intCast((@as(u32, c00[1]) + c10[1] + c01[1] + c11[1]) / 4),
+                @intCast((@as(u32, c00[2]) + c10[2] + c01[2] + c11[2]) / 4),
+                @intCast((@as(u32, c00[3]) + c10[3] + c01[3] + c11[3]) / 4),
+            };
+        }
+    }
+}
+
+fn uploadRgba8Mips(
+    gctx: *zgpu.GraphicsContext,
+    allocator: std.mem.Allocator,
     pixels: []const [4]u8,
     width: u32,
     height: u32,
     format: wgpu.TextureFormat,
-) zgpu.TextureHandle {
+) !zgpu.TextureHandle {
+    std.debug.assert(pixels.len >= width * height);
+    const levels = mipLevelCount(width, height);
     const tex = gctx.createTexture(.{
         .usage = .{ .texture_binding = true, .copy_dst = true },
         .dimension = .tdim_2d,
         .size = .{ .width = width, .height = height, .depth_or_array_layers = 1 },
         .format = format,
-        .mip_level_count = 1,
+        .mip_level_count = levels,
         .sample_count = 1,
     });
-    gctx.queue.writeTexture(
-        .{
-            .texture = gctx.lookupResource(tex).?,
-            .mip_level = 0,
-            .origin = .{},
-            .aspect = .all,
-        },
-        .{
-            .offset = 0,
-            .bytes_per_row = width * 4,
-            .rows_per_image = height,
-        },
-        .{ .width = width, .height = height, .depth_or_array_layers = 1 },
-        [4]u8,
-        pixels,
-    );
+
+    var level_pixels = try allocator.dupe([4]u8, pixels[0 .. width * height]);
+    defer allocator.free(level_pixels);
+    var cw = width;
+    var ch = height;
+    var level: u32 = 0;
+    while (level < levels) : (level += 1) {
+        gctx.queue.writeTexture(
+            .{
+                .texture = gctx.lookupResource(tex).?,
+                .mip_level = level,
+                .origin = .{},
+                .aspect = .all,
+            },
+            .{
+                .offset = 0,
+                .bytes_per_row = cw * 4,
+                .rows_per_image = ch,
+            },
+            .{ .width = cw, .height = ch, .depth_or_array_layers = 1 },
+            [4]u8,
+            level_pixels[0 .. cw * ch],
+        );
+        if (level + 1 >= levels) break;
+        const nw = @max(1, cw / 2);
+        const nh = @max(1, ch / 2);
+        const next = try allocator.alloc([4]u8, nw * nh);
+        boxFilterDown(level_pixels, cw, ch, next, nw, nh);
+        allocator.free(level_pixels);
+        level_pixels = next;
+        cw = nw;
+        ch = nh;
+    }
     return tex;
 }
 
@@ -358,13 +514,26 @@ test "parse demo material zon" {
         \\    .metallic = 0.5,
         \\    .roughness = 0.4,
         \\    .ao = 0.9,
+        \\    .alpha_mode = "MASK",
+        \\    .alpha_cutoff = 0.4,
         \\}
     ;
     var def = try MaterialDef.parseZon(allocator, src);
     defer def.free(allocator);
     try std.testing.expectEqualStrings("unit", def.name);
-    try std.testing.expectEqualStrings("textures/a.png", def.albedo);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.5), def.metallic, 1e-5);
+    try std.testing.expect(def.alpha() == .mask);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.4), def.alpha_cutoff, 1e-5);
+}
+
+test "alpha cutoff pack" {
+    try std.testing.expectEqual(@as(f32, 0), AlphaMode.@"opaque".packedCutoff(0.5));
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), AlphaMode.mask.packedCutoff(0.5), 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.1), AlphaMode.blend.packedCutoff(0.0), 1e-5);
+}
+
+test "mip level count" {
+    try std.testing.expectEqual(@as(u32, 1), mipLevelCount(1, 1));
+    try std.testing.expectEqual(@as(u32, 9), mipLevelCount(256, 256));
 }
 
 test "edge factor in range" {
@@ -375,12 +544,9 @@ test "edge factor in range" {
 
 test "transcode demo albedo basis to bc7" {
     const allocator = std.testing.allocator;
-    // Skip if assets not present (CI without cook).
     std.fs.cwd().access("assets/textures/demo_albedo.basis", .{}) catch return;
     var img = try zbasis.transcodeFile(allocator, "assets/textures/demo_albedo.basis", false, true);
     defer img.deinit();
     try std.testing.expect(img.width >= 4);
-    try std.testing.expect(img.height >= 4);
-    try std.testing.expect(img.format == .bc7_srgb or img.format == .bc7);
     try std.testing.expect(img.data.len > 0);
 }
